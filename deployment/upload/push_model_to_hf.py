@@ -1,3 +1,4 @@
+from __future__ import annotations
 from huggingface_hub import create_repo, HfApi
 
 # 1. create repository

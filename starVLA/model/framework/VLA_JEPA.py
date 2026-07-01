@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License, Version 1.0 (the "License");
 # Implemented by [Junqiu YU / Fudan University] in [2025]. 
@@ -8,6 +9,7 @@ A lightweight implementation that Qwen-VL + Flow-matching head to directly predi
 Flow-matching header is copyright from GR00T N1.5,
 """
 from typing import List
+import time
 from tqdm import tqdm
 from typing import List, Optional, Tuple
 import torch
@@ -66,7 +68,16 @@ class VLA_JEPA(baseframework):
             max_action_tokens=self.config.framework.action_model.action_horizon * 4,
             embodied_action_token=embodied_action_token
         )
-
+        self.register_buffer(
+            "_action_token_ids_tensor",
+            torch.tensor(self.action_token_ids, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_embodied_action_token_id_tensor",
+            torch.tensor([self.embodied_action_token_id], dtype=torch.long),
+            persistent=False,
+        )
         # TODO speical tokens
 
         # align dims --> we should put them to config or no?
@@ -92,12 +103,100 @@ class VLA_JEPA(baseframework):
             action_embed_dim=self.qwen_vl_interface.model.config.hidden_size,
             num_add_tokens=self.config.framework.vj2_model.num_action_tokens_per_timestep,
         )
+        self._maybe_compile_modules()
         self.replace_prompt = "".join(
             [each * self.config.framework.vj2_model.num_action_tokens_per_timestep for each in
              action_tokens[:self.config.framework.vj2_model.num_frames//tubelet_size - 1]]
         )
 
         self.embodied_replace_prompt = "".join([embodied_action_token * self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction])
+        logger.info(
+            f"Qwen prompt placeholders: action_chars={len(self.replace_prompt)}, "
+            f"embodied_chars={len(self.embodied_replace_prompt)}, "
+            f"num_action_token_ids={len(self.action_token_ids)}"
+        )
+
+    def _maybe_compile_modules(self):
+        """Compile stable compute-heavy submodules without touching dynamic HF processors."""
+        trainer_cfg = getattr(self.config, "trainer", {})
+        if not trainer_cfg.get("enable_torch_compile", False):
+            return
+        if not hasattr(torch, "compile"):
+            logger.warning("torch.compile is not available in this PyTorch build; skipping compile.")
+            return
+
+        mode = trainer_cfg.get("torch_compile_mode", "reduce-overhead")
+        backend = trainer_cfg.get("torch_compile_backend", "inductor")
+        fullgraph = bool(trainer_cfg.get("torch_compile_fullgraph", True))
+        dynamic = bool(trainer_cfg.get("torch_compile_dynamic", False))
+        compile_threads = int(trainer_cfg.get("torch_compile_threads", 4))
+        suppress_errors = bool(trainer_cfg.get("torch_compile_suppress_errors", True))
+        try:
+            import torch._dynamo.config as dynamo_config
+            import torch._inductor.config as inductor_config
+
+            dynamo_config.suppress_errors = suppress_errors
+            inductor_config.compile_threads = compile_threads
+        except Exception as exc:
+            logger.warning(f"Could not configure torch.compile options: {exc}")
+        modules = trainer_cfg.get("torch_compile_modules", ["vj_predictor", "action_dit"])
+        logger.info(
+            f"Enabling torch.compile for modules={list(modules)}, backend={backend}, mode={mode}, "
+            f"fullgraph={fullgraph}, dynamic={dynamic}, compile_threads={compile_threads}, "
+            f"suppress_errors={suppress_errors}"
+        )
+
+        if "vj_predictor" in modules:
+            self.vj_predictor = torch.compile(
+                self.vj_predictor,
+                backend=backend,
+                mode=mode,
+                fullgraph=fullgraph,
+                dynamic=dynamic,
+            )
+        if "action_dit_blocks" in modules and hasattr(self.action_model, "model"):
+            transformer_blocks = getattr(self.action_model.model, "transformer_blocks", None)
+            if transformer_blocks is None:
+                logger.warning("Requested action_dit_blocks compile, but action_model.model has no transformer_blocks.")
+            else:
+                for idx, block in enumerate(transformer_blocks):
+                    transformer_blocks[idx] = torch.compile(
+                        block,
+                        backend=backend,
+                        mode=mode,
+                        fullgraph=fullgraph,
+                        dynamic=dynamic,
+                    )
+        if "action_dit_inner" in modules and hasattr(self.action_model, "model"):
+            transformer_blocks = getattr(self.action_model.model, "transformer_blocks", None)
+            if transformer_blocks is None:
+                logger.warning("Requested action_dit_inner compile, but action_model.model has no transformer_blocks.")
+            else:
+                for block in transformer_blocks:
+                    if hasattr(block, "attn1"):
+                        block.attn1 = torch.compile(
+                            block.attn1,
+                            backend=backend,
+                            mode=mode,
+                            fullgraph=fullgraph,
+                            dynamic=dynamic,
+                        )
+                    if hasattr(block, "ff"):
+                        block.ff = torch.compile(
+                            block.ff,
+                            backend=backend,
+                            mode=mode,
+                            fullgraph=fullgraph,
+                            dynamic=dynamic,
+                        )
+        if "action_dit" in modules and hasattr(self.action_model, "model"):
+            self.action_model.model = torch.compile(
+                self.action_model.model,
+                backend=backend,
+                mode=mode,
+                fullgraph=fullgraph,
+                dynamic=dynamic,
+            )
 
     def expand_tokenizer(self, 
                          tokenizer: AutoTokenizer,
@@ -136,12 +235,40 @@ class VLA_JEPA(baseframework):
         """
 
         """
-        batch_images = [example["image"] for example in examples]  # [B, [PIL.Image]]
-        batch_videos = [example["video"] for example in examples]  #  [B, V, T, H, W, 3]
-        instructions = [example["lang"] for example in examples]  # [B, str]
-        actions = [example["action"]for example in examples] if "action" in examples[0] else None # label [B， len, 7]
-        
-        state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+        detailed_timing = bool(self.config.trainer.get("enable_detailed_timing", False))
+        timing = {}
+
+        def sync_cuda():
+            if detailed_timing and torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        def timed(name, fn):
+            if not detailed_timing:
+                return fn()
+            sync_cuda()
+            start = time.perf_counter()
+            result = fn()
+            sync_cuda()
+            timing[name] = time.perf_counter() - start
+            return result
+
+        is_collated_batch = isinstance(examples, dict)
+        if is_collated_batch:
+            batch_images = examples["image"]
+            batch_videos = examples["video"]
+            instructions = examples["lang"]
+            actions = examples.get("action", None)
+            state = examples.get("state", None)
+            vj_pixel_values_videos = examples.get("vj_pixel_values_videos", None)
+            qwen_inputs = examples.get("qwen_inputs", None)
+        else:
+            batch_images = [example["image"] for example in examples]  # [B, [PIL.Image]]
+            batch_videos = [example["video"] for example in examples]  #  [B, V, T, H, W, 3]
+            instructions = [example["lang"] for example in examples]  # [B, str]
+            actions = [example["action"]for example in examples] if "action" in examples[0] else None # label [B， len, 7]
+            state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+            vj_pixel_values_videos = None
+            qwen_inputs = None
 
         """
         if self.action_model.device == torch.device("cuda:0") and "action" in examples[0]:
@@ -172,40 +299,82 @@ class VLA_JEPA(baseframework):
         
 
         #[print(each.shape, end=";") for each in batch_videos]
-        batch_videos = np.stack(batch_videos)  #  [B, V, T, H, W, 3]
-        batch_videos = batch_videos.transpose(0,1,2,5,3,4)  # [B, V, T, 3, H, W]
+        def stack_videos():
+            if torch.is_tensor(batch_videos):
+                return batch_videos.permute(0, 1, 2, 5, 3, 4).contiguous()
+            stacked = np.stack(batch_videos)  #  [B, V, T, H, W, 3]
+            return stacked.transpose(0,1,2,5,3,4)  # [B, V, T, 3, H, W]
+
+        batch_videos = timed("forward/video_numpy_stack_time", stack_videos)
 
         # Step 1: QWenVL input format
-        if actions is not None:
-            qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
-                images=batch_images, 
-                instructions=instructions,
-                prompt_replace_dict={"{actions}":self.replace_prompt, "{e_actions}":self.embodied_replace_prompt},
-                prompt_template=self.config.datasets.vla_data.get("CoT_prompt", "")) 
-        else:
-            qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
-                images=batch_images, 
+        def build_qwen_inputs():
+            if qwen_inputs is not None:
+                return qwen_inputs
+            if actions is not None:
+                return self.qwen_vl_interface.build_qwenvl_inputs(
+                    images=batch_images,
+                    instructions=instructions,
+                    prompt_replace_dict={"{actions}":self.replace_prompt, "{e_actions}":self.embodied_replace_prompt},
+                    prompt_template=self.config.datasets.vla_data.get("CoT_prompt", ""))
+            return self.qwen_vl_interface.build_qwenvl_inputs(
+                images=batch_images,
                 instructions=instructions,
                 prompt_replace_dict={"{actions}":self.replace_prompt},
                 prompt_template=self.config.datasets.video_data.get("CoT_prompt", ""))
-        
-        action_indices = torch.isin(qwen_inputs['input_ids'], torch.tensor(self.action_token_ids, device=qwen_inputs['input_ids'].device))
+
+        qwen_inputs = timed("forward/qwen_build_inputs_h2d_time", build_qwen_inputs)
+        if detailed_timing:
+            input_ids = qwen_inputs["input_ids"]
+            attention_mask = qwen_inputs.get("attention_mask", None)
+            timing["forward/qwen_seq_len"] = float(input_ids.shape[1])
+            if attention_mask is not None:
+                valid_tokens = attention_mask.sum(dim=1).float()
+                timing["forward/qwen_valid_tokens_mean"] = valid_tokens.mean().item()
+                timing["forward/qwen_valid_tokens_max"] = valid_tokens.max().item()
+                timing["forward/qwen_padding_ratio"] = (
+                    1.0 - valid_tokens.mean().item() / max(float(input_ids.shape[1]), 1.0)
+                )
+            image_grid_thw = qwen_inputs.get("image_grid_thw", None)
+            if image_grid_thw is not None:
+                grid_tokens = image_grid_thw.prod(dim=1).float()
+                timing["forward/qwen_num_images"] = float(image_grid_thw.shape[0])
+                timing["forward/qwen_image_tokens_total"] = grid_tokens.sum().item()
+                timing["forward/qwen_image_tokens_per_sample"] = grid_tokens.sum().item() / max(float(input_ids.shape[0]), 1.0)
+
+        action_indices = torch.isin(
+            qwen_inputs['input_ids'],
+            self._action_token_ids_tensor.to(qwen_inputs['input_ids'].device),
+        )
         action_indices = action_indices.nonzero(as_tuple=True)
+        if detailed_timing:
+            timing["forward/qwen_action_token_count"] = float(action_indices[0].numel())
 
         # TODO action condition tokens
         #embodied_action_indices = torch.isin(qwen_inputs['input_ids'], torch.tensor([self.embodied_action_token_id], device=qwen_inputs['input_ids'].device))
-        embodied_action_indices = torch.isin(qwen_inputs['input_ids'], torch.tensor([self.embodied_action_token_id], device=qwen_inputs['input_ids'].device))
+        embodied_action_indices = torch.isin(
+            qwen_inputs['input_ids'],
+            self._embodied_action_token_id_tensor.to(qwen_inputs['input_ids'].device),
+        )
         embodied_action_indices = embodied_action_indices.nonzero(as_tuple=True)
+        if detailed_timing:
+            timing["forward/qwen_embodied_token_count"] = float(embodied_action_indices[0].numel())
         
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
+            def qwen_forward():
+                return self.qwen_vl_interface(
+                    **qwen_inputs,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    use_cache=False,
+                    return_dict=True,
+                )
+
+            qwenvl_outputs = timed("forward/qwen_forward_time", qwen_forward)
             # last_hidden_state: [B, seq_len, H]
-            last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
+            last_hidden = getattr(qwenvl_outputs, "last_hidden_state", None)
+            if last_hidden is None:
+                last_hidden = qwenvl_outputs.hidden_states[-1]
             B, _, H = last_hidden.shape
             action_tokens = last_hidden[action_indices[0], action_indices[1], :].view(B, -1, H)  # [B, action_len, H]
             embodied_action_tokens = last_hidden[embodied_action_indices[0], embodied_action_indices[1], :].view(B, -1, H)  # [B, action_len, H]
@@ -215,14 +384,23 @@ class VLA_JEPA(baseframework):
             # Step 2: JEPA Encoder
             B, V, T, C, H, W = batch_videos.shape
             batch_videos = batch_videos.reshape(B*V, T, C, H, W)  # [B*V, T, C, H, W]
-            input_videos = []
-            for i in range(B*V):
-                input_videos.append(self.vj_processor(
-                    videos=batch_videos[i], return_tensors="pt"
-                )["pixel_values_videos"].to(self.vj_encoder.device))
-            input_videos = torch.cat(input_videos, dim=0)  # [B*V, T, C, H, W]
+
+            def prepare_vj_videos():
+                if vj_pixel_values_videos is not None:
+                    return vj_pixel_values_videos.to(self.vj_encoder.device, non_blocking=True)
+                input_videos = []
+                for i in range(B*V):
+                    input_videos.append(self.vj_processor(
+                        videos=batch_videos[i], return_tensors="pt"
+                    )["pixel_values_videos"].to(self.vj_encoder.device))
+                return torch.cat(input_videos, dim=0)  # [B*V, T, C, H, W]
+
+            input_videos = timed("forward/vj_processor_h2d_time", prepare_vj_videos)
             with torch.no_grad():
-                video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
+                video_embeddings = timed(
+                    "forward/vj_encoder_time",
+                    lambda: self.vj_encoder.get_vision_features(pixel_values_videos=input_videos),
+                )
                 video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=V, dim=0), dim=2)
             #print(video_embeddings.shape) # [B, T//tubelet_size * dim_per_frame, V*embed_dim]
         
@@ -232,26 +410,36 @@ class VLA_JEPA(baseframework):
             gt_states = video_embeddings[:, video_embeddings.shape[1] // T:, :]
             #print(input_states.shape, action_tokens.shape)
             #exit()
-            predicted_states = self.vj_predictor(
-                input_states,
-                action_tokens
+            predicted_states = timed(
+                "forward/vj_predictor_time",
+                lambda: self.vj_predictor(
+                    input_states,
+                    action_tokens
+                ),
             )
 
-            teacher_forcing_wm_loss = F.l1_loss(
-                predicted_states,
-                gt_states,
-                reduction="mean"
+            teacher_forcing_wm_loss = timed(
+                "forward/wm_loss_time",
+                lambda: F.l1_loss(
+                    predicted_states,
+                    gt_states,
+                    reduction="mean"
+                ),
             )
         
-        if "action" not in examples[0]:
+        if actions is None:
+            self.last_forward_timing = timing
             return {"wm_loss": teacher_forcing_wm_loss}
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
             # 标签对齐：取最后 chunk_len 段
-            actions = torch.tensor(
-                np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
-            )  # [B, T_full, action_dim]
+            def move_actions():
+                if torch.is_tensor(actions):
+                    return actions.to(last_hidden.device, dtype=last_hidden.dtype, non_blocking=True)
+                return torch.tensor(np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype)
+
+            actions = timed("forward/action_label_h2d_time", move_actions)  # [B, T_full, action_dim]
             actions_target = actions[:, -(self.future_action_window_size+1):, :]  # (B, chunk_len, action_dim)
 
             repeated_diffusion_steps = (
@@ -262,16 +450,23 @@ class VLA_JEPA(baseframework):
             
             state_repeated = None
             if state is not None:
-                state = torch.tensor(
-                    np.array(state), device=last_hidden.device, dtype=last_hidden.dtype
-                )
+                def move_state():
+                    if torch.is_tensor(state):
+                        return state.to(last_hidden.device, dtype=last_hidden.dtype, non_blocking=True)
+                    return torch.tensor(np.array(state), device=last_hidden.device, dtype=last_hidden.dtype)
+
+                state = timed("forward/state_h2d_time", move_state)
                 #print(state.shape)
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
             #print(embodied_action_repeated.shape, actions_target_repeated.shape, state_repeated.shape) if state_repeated is not None else print("No state for action model")
             #exit()
-            action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
+            action_loss = timed(
+                "forward/action_head_loss_time",
+                lambda: self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated),
+            )  # (B, chunk_len, action_dim)
 
+        self.last_forward_timing = timing
         return {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss * 0.1}
 
     @torch.inference_mode()
@@ -320,11 +515,14 @@ class VLA_JEPA(baseframework):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
-                output_hidden_states=True,
+                output_hidden_states=False,
+                use_cache=False,
                 return_dict=True,
             )
             # last_hidden_state: [B, seq_len, H]
-            last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
+            last_hidden = getattr(qwenvl_outputs, "last_hidden_state", None)
+            if last_hidden is None:
+                last_hidden = qwenvl_outputs.hidden_states[-1]
             B, _, H = last_hidden.shape
             embodied_action_tokens = last_hidden[embodied_action_indices[0], embodied_action_indices[1], :].view(B, -1, H)
 

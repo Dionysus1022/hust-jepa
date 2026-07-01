@@ -1,3 +1,4 @@
+from __future__ import annotations
 import collections
 import dataclasses
 import datetime as dt
@@ -47,6 +48,7 @@ class Args:
     task_suite_name: str = "libero_goal"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    max_eval_tasks: int = 0  # 0 means evaluate all tasks in the suite
     category_value: str = "Background Textures"
             #Background Textures
         #Camera Viewpoints
@@ -69,6 +71,10 @@ class Args:
 
     with_state: str = "true"
 
+    save_videos: str = "true"
+    max_success_videos: int = 10
+    max_failure_videos: int = 10
+
     job_name: str = "test"
 
 
@@ -85,11 +91,24 @@ def eval_libero(args: Args) -> None:
     else:
         task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
+    if args.max_eval_tasks > 0:
+        num_tasks_in_suite = min(num_tasks_in_suite, args.max_eval_tasks)
     logging.info(f"Task suite: {args.task_suite_name}")
+    logging.info(f"Tasks to evaluate: {num_tasks_in_suite}/{task_suite.n_tasks}")
 
     # args.video_out_path = f"{date_base}+{args.job_name}"
     
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    video_out_path = pathlib.Path(args.video_out_path)
+    saved_success_videos = len(list(video_out_path.glob("rollout_*_success.mp4")))
+    saved_failure_videos = len(list(video_out_path.glob("rollout_*_failure.mp4")))
+    logging.info(
+        "Video quotas: success=%d/%d, failure=%d/%d",
+        saved_success_videos,
+        args.max_success_videos,
+        saved_failure_videos,
+        args.max_failure_videos,
+    )
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 250  # longest training demo has 193 steps
@@ -139,7 +158,12 @@ def eval_libero(args: Args) -> None:
 
             # Setup
             t = 0
-            replay_images = []
+            save_videos = args.save_videos.lower() == "true"
+            collect_video = save_videos and (
+                saved_success_videos < args.max_success_videos
+                or saved_failure_videos < args.max_failure_videos
+            )
+            replay_images = [] if collect_video else None
             full_actions = []
 
             logging.info(f"Starting episode {task_episodes + 1}...")
@@ -163,7 +187,8 @@ def eval_libero(args: Args) -> None:
                 )
 
                 # Save preprocessed image for replay video
-                replay_images.append(img)
+                if replay_images is not None:
+                    replay_images.append(img)
 
                 state = np.concatenate(
                     (
@@ -238,12 +263,29 @@ def eval_libero(args: Args) -> None:
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
             task_segment = short_name(task_description.replace(" ", "_"))
-            imageio.mimwrite(
-                pathlib.Path(args.video_out_path)
-                / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=10,
+            should_save_video = replay_images is not None and (
+                (done and saved_success_videos < args.max_success_videos)
+                or (not done and saved_failure_videos < args.max_failure_videos)
             )
+            if should_save_video:
+                imageio.mimwrite(
+                    video_out_path
+                    / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.mp4",
+                    [np.asarray(x) for x in replay_images],
+                    fps=10,
+                )
+                if done:
+                    saved_success_videos += 1
+                else:
+                    saved_failure_videos += 1
+                logging.info(
+                    "Saved %s video (%d/%d successes, %d/%d failures)",
+                    suffix,
+                    saved_success_videos,
+                    args.max_success_videos,
+                    saved_failure_videos,
+                    args.max_failure_videos,
+                )
             
             full_actions = np.stack(full_actions)
             # np.save(pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.npy", full_actions)
@@ -263,6 +305,7 @@ def eval_libero(args: Args) -> None:
         logging.info(
             f"Current total success rate: {float(total_successes) / float(total_episodes)}"
         )
+        env.close()
 
     logging.info(
         f"Total success rate: {float(total_successes) / float(total_episodes)}"
@@ -318,6 +361,6 @@ def start_debugpy_once():
     start_debugpy_once._started = True
 
 if __name__ == "__main__":
-    if os.getenv("DEBUG", False):
+    if os.getenv("DEBUG", "").lower() in {"1", "true", "yes", "on"}:
         start_debugpy_once()
     tyro.cli(eval_libero)

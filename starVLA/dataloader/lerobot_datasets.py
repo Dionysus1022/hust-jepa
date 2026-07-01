@@ -1,14 +1,110 @@
+from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 from omegaconf import OmegaConf
+import numpy as np
+import torch
 
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset, LeRobotMixtureDataset
 from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
 from starVLA.dataloader.gr00t_lerobot.data_config import ROBOT_TYPE_CONFIG_MAP
 from starVLA.dataloader.gr00t_lerobot.embodiment_tags import ROBOT_TYPE_TO_EMBODIMENT_TAG, EmbodimentTag
 
-def collate_fn(batch):
-    return batch
+_VJ_PROCESSOR = None
+_VJ_PROCESSOR_PATH = None
+_QWEN_PROCESSOR = None
+_QWEN_PROCESSOR_PATH = None
+
+
+def _get_vj_processor(processor_path):
+    global _VJ_PROCESSOR, _VJ_PROCESSOR_PATH
+    if _VJ_PROCESSOR is None or _VJ_PROCESSOR_PATH != processor_path:
+        from transformers import AutoVideoProcessor
+
+        _VJ_PROCESSOR = AutoVideoProcessor.from_pretrained(processor_path)
+        _VJ_PROCESSOR_PATH = processor_path
+    return _VJ_PROCESSOR
+
+
+def _get_qwen_processor(model_path, action_tokens, embodied_action_token):
+    global _QWEN_PROCESSOR, _QWEN_PROCESSOR_PATH
+    if _QWEN_PROCESSOR is None or _QWEN_PROCESSOR_PATH != model_path:
+        from transformers import AutoProcessor
+
+        _QWEN_PROCESSOR = AutoProcessor.from_pretrained(model_path)
+        _QWEN_PROCESSOR.tokenizer.padding_side = "left"
+        for token in action_tokens:
+            if token not in _QWEN_PROCESSOR.tokenizer.get_vocab():
+                _QWEN_PROCESSOR.tokenizer.add_tokens([token], special_tokens=True)
+        if embodied_action_token not in _QWEN_PROCESSOR.tokenizer.get_vocab():
+            _QWEN_PROCESSOR.tokenizer.add_tokens([embodied_action_token], special_tokens=True)
+        _QWEN_PROCESSOR_PATH = model_path
+    return _QWEN_PROCESSOR
+
+
+def collate_fn(
+    batch,
+    vj_processor_path=None,
+    preprocess_vj_inputs=False,
+    qwen_processor_path=None,
+    preprocess_qwen_inputs=False,
+    qwen_prompt_template="",
+    qwen_replace_prompt="",
+    qwen_embodied_replace_prompt="",
+    qwen_action_tokens=None,
+    qwen_embodied_action_token="<|embodied_action|>",
+):
+    videos_np = np.stack([example["video"] for example in batch])  # [B, V, T, H, W, C]
+    collated = {
+        "image": [example["image"] for example in batch],
+        "lang": [example["lang"] for example in batch],
+        "video": torch.from_numpy(videos_np),
+        "action": torch.from_numpy(np.stack([example["action"] for example in batch])),
+    }
+    if "state" in batch[0]:
+        collated["state"] = torch.from_numpy(np.stack([example["state"] for example in batch]))
+
+    if preprocess_qwen_inputs:
+        if not qwen_processor_path:
+            raise ValueError("qwen_processor_path is required when preprocess_qwen_inputs=True")
+        qwen_action_tokens = qwen_action_tokens or []
+        processor = _get_qwen_processor(qwen_processor_path, qwen_action_tokens, qwen_embodied_action_token)
+        messages = []
+        for imgs, instruction in zip(collated["image"], collated["lang"]):
+            prompt = qwen_prompt_template.replace("{instruction}", instruction)
+            prompt = prompt.replace("{actions}", qwen_replace_prompt)
+            prompt = prompt.replace("{e_actions}", qwen_embodied_replace_prompt)
+            messages.append(
+                [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "image": img} for img in imgs] + [{"type": "text", "text": prompt}],
+                    }
+                ]
+            )
+        collated["qwen_inputs"] = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            padding=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+
+    if preprocess_vj_inputs:
+        if not vj_processor_path:
+            raise ValueError("vj_processor_path is required when preprocess_vj_inputs=True")
+        processor = _get_vj_processor(vj_processor_path)
+        videos = videos_np.transpose(0, 1, 2, 5, 3, 4)  # [B, V, T, C, H, W]
+        B, V, T, C, H, W = videos.shape
+        videos = videos.reshape(B * V, T, C, H, W)
+        processed = [
+            processor(videos=videos[i], return_tensors="pt")["pixel_values_videos"]
+            for i in range(B * V)
+        ]
+        collated["vj_pixel_values_videos"] = torch.cat(processed, dim=0)
+
+    return collated
 
 def make_LeRobotSingleDataset(
     data_root_dir: Path | str,

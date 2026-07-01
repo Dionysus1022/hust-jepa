@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Copyright 2025 CogACT. All rights reserved.
 # Modified by [Jinhui YE/ HKUST University] in [2025]. 
 # Modification: [add global config ].

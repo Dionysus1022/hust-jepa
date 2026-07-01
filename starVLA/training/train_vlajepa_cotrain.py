@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License, Version 1.0 (the "License"); 
 # Implemented by [Jinhui YE / HKUST University] in [2025].
@@ -146,7 +147,15 @@ class VLAMTrainer(TrainerUtils):
             reload_modules = (
                 self.config.trainer.reload_modules if hasattr(self.config.trainer, "reload_modules") else None
             )
-            self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
+            ignore_mismatched_sizes = bool(
+                getattr(self.config.trainer, "ignore_mismatched_pretrained", False)
+            )
+            self.model = self.load_pretrained_backbones(
+                self.model,
+                pretrained_checkpoint,
+                reload_modules=reload_modules,
+                ignore_mismatched_sizes=ignore_mismatched_sizes,
+            )
 
         # freeze parameters
         freeze_modules = (

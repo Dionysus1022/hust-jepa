@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Adds NumPy array support to msgpack.
 
 msgpack is good for (de)serializing data over a network for multiple reasons:

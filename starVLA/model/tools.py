@@ -1,3 +1,4 @@
+from __future__ import annotations
 def auto_get_module_keys(module, max_depth=0, prefix_list=None, current_depth=0, current_prefix=""):
     """
     get all submodule keys of a module, support setting recursion depth and prefix list.

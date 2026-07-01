@@ -7,9 +7,9 @@
     },
     "train_micro_batch_size_per_gpu": "auto",
     "train_batch_size": "auto",
-    "gradient_accumulation_steps": 1,
+    "gradient_accumulation_steps": "auto",
     "zero_optimization": {
-        "stage": 2,
+        "stage": 1,
         "allgather_partitions": true,
         "allgather_bucket_size": 5e8,
         "reduce_scatter": true,

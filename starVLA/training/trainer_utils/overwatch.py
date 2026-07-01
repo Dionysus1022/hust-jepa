@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 overwatch.py
 # Original file from OpenVLA project (Prismatic), licensed under MIT License.

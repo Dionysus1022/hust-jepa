@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 import os
 from accelerate.logging import get_logger
@@ -39,7 +40,37 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
 
     if dataset_py == "lerobot_datasets":
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
+        from transformers import AutoConfig
+
         vla_dataset_cfg = cfg.datasets.vla_data
+        vj_config = AutoConfig.from_pretrained(cfg.framework.vj2_model.base_encoder)
+        tubelet_size = getattr(vj_config, "tubelet_size", 1)
+        action_tokens = [
+            cfg.framework.vj2_model.special_action_token.format(i)
+            for i in range(cfg.framework.action_model.action_horizon * 4)
+        ]
+        replace_prompt = "".join(
+            [
+                each * cfg.framework.vj2_model.num_action_tokens_per_timestep
+                for each in action_tokens[: cfg.framework.vj2_model.num_frames // tubelet_size - 1]
+            ]
+        )
+        embodied_action_token = cfg.framework.vj2_model.get("embodied_action_token", "<|embodied_action|>")
+        embodied_replace_prompt = (
+            embodied_action_token * cfg.framework.vj2_model.num_embodied_action_tokens_per_instruction
+        )
+        custom_collate_fn = partial(
+            collate_fn,
+            vj_processor_path=cfg.framework.vj2_model.base_encoder,
+            preprocess_vj_inputs=vla_dataset_cfg.get("preprocess_vj_inputs_in_collate", True),
+            qwen_processor_path=cfg.framework.qwenvl.base_vlm,
+            preprocess_qwen_inputs=vla_dataset_cfg.get("preprocess_qwen_inputs_in_collate", False),
+            qwen_prompt_template=vla_dataset_cfg.get("CoT_prompt", ""),
+            qwen_replace_prompt=replace_prompt,
+            qwen_embodied_replace_prompt=embodied_replace_prompt,
+            qwen_action_tokens=action_tokens,
+            qwen_embodied_action_token=embodied_action_token,
+        )
 
         vla_dataset = get_vla_dataset(
             data_cfg=vla_dataset_cfg,
@@ -49,8 +80,11 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         vla_train_dataloader = DataLoader(
             vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
-            collate_fn=collate_fn,
+            collate_fn=custom_collate_fn,
             num_workers=8,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4,
             # shuffle=True
         )        
         if dist.get_rank() == 0: 

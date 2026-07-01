@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Debug / smoke-test client for deployment/model_server/server_policy.py.
 

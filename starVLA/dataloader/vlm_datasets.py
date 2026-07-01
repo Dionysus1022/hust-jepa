@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import copy
 import json
@@ -23,6 +24,7 @@ import transformers
 from omegaconf import OmegaConf
 from starVLA.dataloader.qwenvl_llavajson.qwen_data_config import data_list
 from starVLA.dataloader.qwenvl_llavajson.rope2d import get_rope_index_25, get_rope_index_2
+from starVLA.model.modules.vlm import get_vlm_data_model_type
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
@@ -576,7 +578,7 @@ def make_vlm_dataloader(cfg):
     image_processor.min_pixels = int(data_args.min_pixels)
     image_processor.size["longest_edge"] = int(data_args.max_pixels)
     image_processor.size["shortest_edge"] = int(data_args.min_pixels)
-    data_args.model_type = "qwen2.5vl"
+    data_args.model_type = get_vlm_data_model_type(cfg.framework.qwenvl.base_vlm)
     data_args_ns = SimpleNamespace(**OmegaConf.to_container(data_args, resolve=True))
     data_args_ns.image_processor = image_processor  # TODO later remove the logic bound to model
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args_ns)
@@ -630,7 +632,7 @@ if __name__ == "__main__":
     image_processor.min_pixels = data_args.min_pixels
     image_processor.size["longest_edge"] = data_args.max_pixels
     image_processor.size["shortest_edge"] = data_args.min_pixels
-    data_args.model_type = "qwen2.5vl"
+    data_args.model_type = get_vlm_data_model_type(cfg.framework.qwenvl.base_vlm)
     data_args_ns = SimpleNamespace(**OmegaConf.to_container(data_args, resolve=True))
     data_args_ns.image_processor = image_processor
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args_ns)

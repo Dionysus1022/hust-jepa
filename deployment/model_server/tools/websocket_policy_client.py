@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License, Version 1.0 (the "License"); 
 # Implemented by [Jinhui YE / HKUST University] in [2025].
@@ -49,8 +50,8 @@ class WebsocketClientPolicy:
                     max_size=None,
                     additional_headers=headers,
                     open_timeout=150,
-                    ping_interval=20,
-                    ping_timeout=20,
+                    
+                    
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
