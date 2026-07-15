@@ -4,6 +4,7 @@ from typing import Sequence
 from omegaconf import OmegaConf
 import numpy as np
 import torch
+from PIL import Image
 
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset, LeRobotMixtureDataset
 from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
@@ -16,6 +17,89 @@ _QWEN_PROCESSOR = None
 _QWEN_PROCESSOR_PATH = None
 
 
+def _sample_range(value, default):
+    if value is None:
+        return default
+    if len(value) == 1:
+        delta = float(value[0])
+        return float(np.random.uniform(1.0 - delta, 1.0 + delta))
+    return float(np.random.uniform(float(value[0]), float(value[1])))
+
+
+def _augment_video_frames(video, augmentation):
+    if not augmentation or not augmentation.get("enabled", False):
+        return video
+    order = list(augmentation.get("augment_order", []))
+    if not order:
+        return video
+
+    from torchvision.transforms import RandomResizedCrop
+    from torchvision.transforms import functional as TVF
+
+    frames = video
+    is_video = frames.ndim == 4
+    def to_uint8(frame):
+        if frame.dtype == np.uint8:
+            return frame
+        frame = np.asarray(frame)
+        if frame.max() <= 1.0:
+            frame = frame * 255.0
+        return np.clip(frame, 0, 255).astype(np.uint8)
+
+    pil_frames = [Image.fromarray(to_uint8(frame)) for frame in (frames if is_video else [frames])]
+    out_h, out_w = pil_frames[0].height, pil_frames[0].width
+
+    crop_params = None
+    rrc = augmentation.get("random_resized_crop", None)
+    if "random_resized_crop" in order and rrc is not None:
+        scale = tuple(rrc.get("scale", (0.9, 1.0)))
+        ratio = tuple(rrc.get("ratio", (1.0, 1.0)))
+        crop_params = RandomResizedCrop.get_params(pil_frames[0], scale=scale, ratio=ratio)
+
+    brightness = _sample_range(augmentation.get("random_brightness", None), 1.0)
+    contrast = _sample_range(augmentation.get("random_contrast", None), 1.0)
+    saturation = _sample_range(augmentation.get("random_saturation", None), 1.0)
+    hue_cfg = augmentation.get("random_hue", None)
+    hue = 0.0
+    if hue_cfg:
+        if len(hue_cfg) == 1:
+            hue = float(np.random.uniform(-float(hue_cfg[0]), float(hue_cfg[0])))
+        else:
+            hue = float(np.random.uniform(float(hue_cfg[0]), float(hue_cfg[1])))
+        hue = float(np.clip(hue, -0.5, 0.5))
+
+    out = []
+    for frame in pil_frames:
+        for op in order:
+            if op == "random_resized_crop" and crop_params is not None:
+                i, j, h, w = crop_params
+                frame = TVF.resized_crop(frame, i, j, h, w, size=(out_h, out_w))
+            elif op == "random_brightness":
+                frame = TVF.adjust_brightness(frame, brightness)
+            elif op == "random_contrast":
+                frame = TVF.adjust_contrast(frame, contrast)
+            elif op == "random_saturation":
+                frame = TVF.adjust_saturation(frame, saturation)
+            elif op == "random_hue":
+                frame = TVF.adjust_hue(frame, hue)
+        out.append(np.asarray(frame, dtype=np.uint8))
+    out = np.stack(out, axis=0)
+    return out if is_video else out[0]
+
+
+def _augment_example(example, augmentation):
+    if not augmentation or not augmentation.get("enabled", False):
+        return example["video"], example["image"]
+
+    videos = np.asarray(example["video"])
+    aug_videos = np.stack([_augment_video_frames(view, augmentation) for view in videos], axis=0)
+    images = []
+    for view_idx, frame in enumerate(aug_videos[:, 0]):
+        target_size = example["image"][view_idx].size if view_idx < len(example["image"]) else (frame.shape[1], frame.shape[0])
+        images.append(Image.fromarray(frame.astype(np.uint8)).resize(target_size))
+    return aug_videos, images
+
+
 def _get_vj_processor(processor_path):
     global _VJ_PROCESSOR, _VJ_PROCESSOR_PATH
     if _VJ_PROCESSOR is None or _VJ_PROCESSOR_PATH != processor_path:
@@ -26,7 +110,7 @@ def _get_vj_processor(processor_path):
     return _VJ_PROCESSOR
 
 
-def _get_qwen_processor(model_path, action_tokens, embodied_action_token):
+def _get_qwen_processor(model_path, action_tokens, embodied_action_token, future_tokens=None):
     global _QWEN_PROCESSOR, _QWEN_PROCESSOR_PATH
     if _QWEN_PROCESSOR is None or _QWEN_PROCESSOR_PATH != model_path:
         from transformers import AutoProcessor
@@ -34,6 +118,9 @@ def _get_qwen_processor(model_path, action_tokens, embodied_action_token):
         _QWEN_PROCESSOR = AutoProcessor.from_pretrained(model_path)
         _QWEN_PROCESSOR.tokenizer.padding_side = "left"
         for token in action_tokens:
+            if token not in _QWEN_PROCESSOR.tokenizer.get_vocab():
+                _QWEN_PROCESSOR.tokenizer.add_tokens([token], special_tokens=True)
+        for token in future_tokens or []:
             if token not in _QWEN_PROCESSOR.tokenizer.get_vocab():
                 _QWEN_PROCESSOR.tokenizer.add_tokens([token], special_tokens=True)
         if embodied_action_token not in _QWEN_PROCESSOR.tokenizer.get_vocab():
@@ -53,10 +140,18 @@ def collate_fn(
     qwen_embodied_replace_prompt="",
     qwen_action_tokens=None,
     qwen_embodied_action_token="<|embodied_action|>",
+    qwen_future_tokens=None,
+    augmentation=None,
 ):
-    videos_np = np.stack([example["video"] for example in batch])  # [B, V, T, H, W, C]
+    if augmentation and augmentation.get("enabled", False):
+        augmented = [_augment_example(example, augmentation) for example in batch]
+        batch_images = [item[1] for item in augmented]
+        videos_np = np.stack([item[0] for item in augmented])  # [B, V, T, H, W, C]
+    else:
+        batch_images = [example["image"] for example in batch]
+        videos_np = np.stack([example["video"] for example in batch])  # [B, V, T, H, W, C]
     collated = {
-        "image": [example["image"] for example in batch],
+        "image": batch_images,
         "lang": [example["lang"] for example in batch],
         "video": torch.from_numpy(videos_np),
         "action": torch.from_numpy(np.stack([example["action"] for example in batch])),
@@ -68,7 +163,12 @@ def collate_fn(
         if not qwen_processor_path:
             raise ValueError("qwen_processor_path is required when preprocess_qwen_inputs=True")
         qwen_action_tokens = qwen_action_tokens or []
-        processor = _get_qwen_processor(qwen_processor_path, qwen_action_tokens, qwen_embodied_action_token)
+        processor = _get_qwen_processor(
+            qwen_processor_path,
+            qwen_action_tokens,
+            qwen_embodied_action_token,
+            future_tokens=qwen_future_tokens,
+        )
         messages = []
         for imgs, instruction in zip(collated["image"], collated["lang"]):
             prompt = qwen_prompt_template.replace("{instruction}", instruction)

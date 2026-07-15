@@ -4,6 +4,7 @@ import os
 import socket
 
 import torch
+from accelerate import PartialState
 
 from deployment.model_server.tools.batched_websocket_policy_server import BatchedWebsocketPolicyServer
 from starVLA.model.framework.base_framework import baseframework
@@ -12,6 +13,7 @@ from starVLA.model.framework.base_framework import baseframework
 def main(args) -> None:
     device = torch.device(f"cuda:{args.cuda}")
     torch.cuda.set_device(device)
+    PartialState()
 
     vla = baseframework.from_pretrained(
         args.ckpt_path,

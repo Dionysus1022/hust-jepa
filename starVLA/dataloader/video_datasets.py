@@ -10,6 +10,40 @@ from PIL import Image
 
 from transformers import VJEPA2VideoProcessor
 
+_VJ_PROCESSOR = None
+_VJ_PROCESSOR_PATH = None
+_QWEN_PROCESSOR = None
+_QWEN_PROCESSOR_PATH = None
+
+
+def _get_vj_processor(processor_path):
+    global _VJ_PROCESSOR, _VJ_PROCESSOR_PATH
+    if _VJ_PROCESSOR is None or _VJ_PROCESSOR_PATH != processor_path:
+        from transformers import AutoVideoProcessor
+
+        _VJ_PROCESSOR = AutoVideoProcessor.from_pretrained(processor_path)
+        _VJ_PROCESSOR_PATH = processor_path
+    return _VJ_PROCESSOR
+
+
+def _get_qwen_processor(model_path, action_tokens, embodied_action_token, future_tokens=None):
+    global _QWEN_PROCESSOR, _QWEN_PROCESSOR_PATH
+    if _QWEN_PROCESSOR is None or _QWEN_PROCESSOR_PATH != model_path:
+        from transformers import AutoProcessor
+
+        _QWEN_PROCESSOR = AutoProcessor.from_pretrained(model_path)
+        _QWEN_PROCESSOR.tokenizer.padding_side = "left"
+        for token in action_tokens:
+            if token not in _QWEN_PROCESSOR.tokenizer.get_vocab():
+                _QWEN_PROCESSOR.tokenizer.add_tokens([token], special_tokens=True)
+        for token in future_tokens or []:
+            if token not in _QWEN_PROCESSOR.tokenizer.get_vocab():
+                _QWEN_PROCESSOR.tokenizer.add_tokens([token], special_tokens=True)
+        if embodied_action_token not in _QWEN_PROCESSOR.tokenizer.get_vocab():
+            _QWEN_PROCESSOR.tokenizer.add_tokens([embodied_action_token], special_tokens=True)
+        _QWEN_PROCESSOR_PATH = model_path
+    return _QWEN_PROCESSOR
+
 def random_crop_or_pad(video, target_h, target_w, pad_value=0):
     """
     video: np.ndarray [T, H, W, 3]
@@ -60,21 +94,80 @@ def resize_video(video, target_h, target_w):
 
     return out
 
-def collate_fn(batch, n_views=2, resolution_size=224):
-    examples = []
+def collate_fn(
+    batch,
+    n_views=2,
+    resolution_size=224,
+    vj_processor_path=None,
+    preprocess_vj_inputs=False,
+    qwen_processor_path=None,
+    preprocess_qwen_inputs=False,
+    qwen_prompt_template="",
+    qwen_replace_prompt="",
+    qwen_action_tokens=None,
+    qwen_embodied_action_token="<|embodied_action|>",
+    qwen_future_tokens=None,
+):
+    images = []
+    videos = []
+    instructions = []
     for b in batch:
         video, instruction = b[0], b[1]
-        example = {}
-        example["image"] = [Image.fromarray(video[0]).resize((resolution_size, resolution_size))]
-        example["video"] = np.stack([video, video.copy()], axis=0)  # [n_views, T, H, W, C]
-        example["lang"] = instruction
-        examples.append(example)
+        images.append([Image.fromarray(video[0]).resize((resolution_size, resolution_size))])
+        videos.append(np.stack([video.copy() for _ in range(n_views)], axis=0))  # [V, T, H, W, C]
+        instructions.append(instruction)
 
-        #print(video.shape, video_batch["video"][0].shape)
-        #print(video_batch["image"][0])
-        #print(video_batch["lang"][0])
-        #exit()
-    return examples
+    videos_np = np.stack(videos)  # [B, V, T, H, W, C]
+    collated = {
+        "image": images,
+        "video": torch.from_numpy(videos_np),
+        "lang": instructions,
+    }
+
+    if preprocess_qwen_inputs:
+        if not qwen_processor_path:
+            raise ValueError("qwen_processor_path is required when preprocess_qwen_inputs=True")
+        processor = _get_qwen_processor(
+            qwen_processor_path,
+            qwen_action_tokens or [],
+            qwen_embodied_action_token,
+            future_tokens=qwen_future_tokens,
+        )
+        messages = []
+        for imgs, instruction in zip(images, instructions):
+            prompt = qwen_prompt_template.replace("{instruction}", instruction)
+            prompt = prompt.replace("{actions}", qwen_replace_prompt)
+            messages.append(
+                [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "image": img} for img in imgs] + [{"type": "text", "text": prompt}],
+                    }
+                ]
+            )
+        collated["qwen_inputs"] = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            padding=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+
+    if preprocess_vj_inputs:
+        if not vj_processor_path:
+            raise ValueError("vj_processor_path is required when preprocess_vj_inputs=True")
+        processor = _get_vj_processor(vj_processor_path)
+        videos_for_processor = videos_np.transpose(0, 1, 2, 5, 3, 4)  # [B, V, T, C, H, W]
+        B, V, T, C, H, W = videos_for_processor.shape
+        videos_for_processor = videos_for_processor.reshape(B * V, T, C, H, W)
+        processed = [
+            processor(videos=videos_for_processor[i], return_tensors="pt")["pixel_values_videos"]
+            for i in range(B * V)
+        ]
+        collated["vj_pixel_values_videos"] = torch.cat(processed, dim=0)
+
+    return collated
 
 class VideoFolderDataset(Dataset):
     def __init__(
@@ -126,15 +219,12 @@ class VideoFolderDataset(Dataset):
 
         start = random.randint(0, frame_count - self.n_frames)
 
-        # 3️⃣ 连续、递增、合法的 frame_ids
-        frame_ids = np.arange(start, start + self.n_frames, dtype=np.int64)
-
         frames = []
-        for idx in frame_ids:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+        for frame_offset in range(self.n_frames):
             ret, frame = cap.read()
             if not ret:
-                raise ValueError(f"Unable to read frame at index {idx}")
+                raise ValueError(f"Unable to read frame at index {start + frame_offset}")
             frames.append(frame)
         cap.release()
         #frames = random_crop_or_pad(

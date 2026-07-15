@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import torch
 import json
+import logging
 from pathlib import Path
 from typing import Optional, List
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -20,6 +21,7 @@ from qwen_vl_utils import process_vision_info
 from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
+py_logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
@@ -74,6 +76,23 @@ def _get_qwen3_model_class(model_id: str):
     return Qwen3VLForConditionalGeneration
 
 
+def _resolve_attn_implementation(model_cls, requested: str) -> str:
+    supports_flash_attn = getattr(model_cls, "_supports_flash_attn", False) or getattr(
+        model_cls, "_supports_flash_attn_2", False
+    )
+    if requested == "flash_attention_2" and not supports_flash_attn:
+        fallback = "sdpa" if getattr(model_cls, "_supports_sdpa", False) else "eager"
+        py_logger.warning(
+            "%s does not advertise FlashAttention-2 support in this transformers build; "
+            "using attn_implementation=%s instead of %s.",
+            model_cls.__name__,
+            fallback,
+            requested,
+        )
+        return fallback
+    return requested
+
+
 class _QWen3_VL_Interface(nn.Module):
     """
     This exists because of the diversity of VLMs, so we encapsulate the changes here.
@@ -98,13 +117,21 @@ class _QWen3_VL_Interface(nn.Module):
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3-VL-4B-Instruct")
 
         model_cls = _get_qwen3_model_class(model_id)
-        logger.info(f"Loading Qwen VLM from {model_id} with class {model_cls.__name__}")
+        attn_implementation = _resolve_attn_implementation(
+            model_cls,
+            qwenvl_config.get("attn_implementation", "flash_attention_2"),
+        )
+        logger.info(
+            f"Loading Qwen VLM from {model_id} with class {model_cls.__name__} "
+            f"and attn_implementation={attn_implementation}"
+        )
         model = model_cls.from_pretrained(
             model_id,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             dtype=torch.bfloat16,
             device_map="cuda",
         )
+        logger.info(f"Loaded Qwen VLM with resolved attn_implementation={model.config._attn_implementation}")
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 

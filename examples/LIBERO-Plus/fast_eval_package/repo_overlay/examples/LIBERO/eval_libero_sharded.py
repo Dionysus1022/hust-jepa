@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import collections
 import dataclasses
 import json
@@ -49,12 +51,7 @@ def resolve_task_range(num_tasks: int, args: Args) -> range:
     if args.shard_index < 0 or args.shard_index >= args.num_shards:
         raise ValueError(f"shard_index must be in [0, {args.num_shards}), got {args.shard_index}")
 
-    base_size = num_tasks // args.num_shards
-    remainder = num_tasks % args.num_shards
-    start = args.shard_index * base_size + min(args.shard_index, remainder)
-    shard_size = base_size + (1 if args.shard_index < remainder else 0)
-    end = start + shard_size
-    return range(start, end)
+    return range(args.shard_index, num_tasks, args.num_shards)
 
 
 def eval_libero(args: Args) -> None:
@@ -71,13 +68,15 @@ def eval_libero(args: Args) -> None:
     task_range = resolve_task_range(num_tasks_in_suite, args)
     logging.info(f"Task suite: {args.task_suite_name}")
     logging.info(
-        "Task shard: %s/%s, explicit range=(%s, %s), resolved=[%s, %s), total_tasks=%s",
+        "Task shard: %s/%s, explicit range=(%s, %s), resolved=start=%s, stop=%s, step=%s, count=%s, total_tasks=%s",
         args.shard_index,
         args.num_shards,
         args.task_start,
         args.task_end,
         task_range.start,
         task_range.stop,
+        task_range.step,
+        len(task_range),
         num_tasks_in_suite,
     )
 
@@ -95,15 +94,20 @@ def eval_libero(args: Args) -> None:
         max_steps = 400
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
+    if args.max_steps is not None:
+        max_steps = args.max_steps
+    logging.info("Max policy steps per episode: %s", max_steps)
 
     model = M1Inference(
         policy_ckpt_path=args.pretrained_path,
         host=args.host,
         port=args.port,
         image_size=args.resize_size,
+        replan_steps=args.replan_steps,
     )
 
     total_episodes, total_successes = 0, 0
+    successful_completion_steps = []
     for task_id in tqdm.tqdm(task_range):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
@@ -180,6 +184,16 @@ def eval_libero(args: Args) -> None:
                 if done:
                     task_successes += 1
                     total_successes += 1
+                    completion_steps = step + 1
+                    successful_completion_steps.append(completion_steps)
+                    avg_completion_steps = float(np.mean(successful_completion_steps))
+                    logging.info(
+                        "Successful episode completed in %d policy steps; "
+                        "running successful-episode average: %.2f policy steps over %d successes",
+                        completion_steps,
+                        avg_completion_steps,
+                        len(successful_completion_steps),
+                    )
                     break
                 t += 1
                 step += 1
@@ -202,6 +216,12 @@ def eval_libero(args: Args) -> None:
             logging.info(f"Success: {done}")
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+            if successful_completion_steps:
+                logging.info(
+                    "Average successful completion steps so far: %.2f over %d successes",
+                    float(np.mean(successful_completion_steps)),
+                    len(successful_completion_steps),
+                )
 
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
@@ -211,6 +231,12 @@ def eval_libero(args: Args) -> None:
         return
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+    if successful_completion_steps:
+        logging.info(
+            "Final average successful completion steps: %.2f over %d successes",
+            float(np.mean(successful_completion_steps)),
+            len(successful_completion_steps),
+        )
 
 
 def start_debugpy_once():

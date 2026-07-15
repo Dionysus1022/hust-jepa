@@ -13,6 +13,28 @@ from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
 
 logger = get_logger(__name__)
 
+
+def _build_jepa_prompt_tokens(cfg, tubelet_size):
+    action_tokens = [
+        cfg.framework.vj2_model.special_action_token.format(i)
+        for i in range(cfg.framework.action_model.action_horizon * 4)
+    ]
+    num_future_steps = cfg.framework.vj2_model.num_frames // tubelet_size - 1
+    use_future_tokens = bool(cfg.framework.vj2_model.get("enable_future_tokens", False))
+    future_special_token = cfg.framework.vj2_model.get("special_future_token", "<|future_{}|>")
+    future_tokens = [future_special_token.format(i + 1) for i in range(num_future_steps)]
+    if use_future_tokens:
+        replace_prompt = "".join(
+            action_tokens[i] * cfg.framework.vj2_model.num_action_tokens_per_timestep + future_tokens[i]
+            for i in range(num_future_steps)
+        )
+    else:
+        replace_prompt = "".join(
+            action_tokens[i] * cfg.framework.vj2_model.num_action_tokens_per_timestep
+            for i in range(num_future_steps)
+        )
+    return action_tokens, future_tokens if use_future_tokens else [], replace_prompt
+
 def save_dataset_statistics(dataset_statistics, run_dir):
     """Saves a `dataset_statistics.json` file."""
     out_path = run_dir / "dataset_statistics.json"
@@ -45,16 +67,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         vla_dataset_cfg = cfg.datasets.vla_data
         vj_config = AutoConfig.from_pretrained(cfg.framework.vj2_model.base_encoder)
         tubelet_size = getattr(vj_config, "tubelet_size", 1)
-        action_tokens = [
-            cfg.framework.vj2_model.special_action_token.format(i)
-            for i in range(cfg.framework.action_model.action_horizon * 4)
-        ]
-        replace_prompt = "".join(
-            [
-                each * cfg.framework.vj2_model.num_action_tokens_per_timestep
-                for each in action_tokens[: cfg.framework.vj2_model.num_frames // tubelet_size - 1]
-            ]
-        )
+        action_tokens, future_tokens, replace_prompt = _build_jepa_prompt_tokens(cfg, tubelet_size)
         embodied_action_token = cfg.framework.vj2_model.get("embodied_action_token", "<|embodied_action|>")
         embodied_replace_prompt = (
             embodied_action_token * cfg.framework.vj2_model.num_embodied_action_tokens_per_instruction
@@ -70,6 +83,8 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             qwen_embodied_replace_prompt=embodied_replace_prompt,
             qwen_action_tokens=action_tokens,
             qwen_embodied_action_token=embodied_action_token,
+            qwen_future_tokens=future_tokens,
+            augmentation=vla_dataset_cfg.get("augmentation", None),
         )
 
         vla_dataset = get_vla_dataset(
@@ -130,8 +145,13 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         return vla_train_dataloader
     elif dataset_py == "video_datasets":
         from starVLA.dataloader.video_datasets import VideoFolderDataset, collate_fn
+        from transformers import AutoConfig
 
         video_dataset_cfg = cfg.datasets.video_data
+        vj_config = AutoConfig.from_pretrained(cfg.framework.vj2_model.base_encoder)
+        tubelet_size = getattr(vj_config, "tubelet_size", 1)
+        action_tokens, future_tokens, replace_prompt = _build_jepa_prompt_tokens(cfg, tubelet_size)
+        embodied_action_token = cfg.framework.vj2_model.get("embodied_action_token", "<|embodied_action|>")
 
         video_dataset = VideoFolderDataset(
             video_dir=video_dataset_cfg.video_dir,
@@ -145,7 +165,16 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
 
         video_collate_fn = partial(collate_fn, 
             n_views=2,
-            resolution_size=video_dataset_cfg.resolution_size)
+            resolution_size=video_dataset_cfg.resolution_size,
+            vj_processor_path=cfg.framework.vj2_model.base_encoder,
+            preprocess_vj_inputs=video_dataset_cfg.get("preprocess_vj_inputs_in_collate", False),
+            qwen_processor_path=cfg.framework.qwenvl.base_vlm,
+            preprocess_qwen_inputs=video_dataset_cfg.get("preprocess_qwen_inputs_in_collate", False),
+            qwen_prompt_template=video_dataset_cfg.get("CoT_prompt", ""),
+            qwen_replace_prompt=replace_prompt,
+            qwen_action_tokens=action_tokens,
+            qwen_embodied_action_token=embodied_action_token,
+            qwen_future_tokens=future_tokens)
 
         train_sampler = torch.utils.data.distributed.DistributedSampler(video_dataset, shuffle=True)
 

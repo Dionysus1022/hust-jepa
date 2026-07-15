@@ -60,7 +60,9 @@ datasets:
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
     resolution_size: 224   # image input of VLA will be resized and video will not, video will be precessed by world model videoprocessor
     video_resolution_size: 256
-    per_device_batch_size: 16
+    per_device_batch_size: 8
+    preprocess_vj_inputs_in_collate: true
+    preprocess_qwen_inputs_in_collate: true
     load_all_data_for_training: true
     with_state: false
   video_data:
@@ -71,7 +73,9 @@ datasets:
     extensions: [webm]
     resolution_size: 224
     video_resolution_size: 256
-    per_device_batch_size: 16
+    per_device_batch_size: 8
+    preprocess_vj_inputs_in_collate: true
+    preprocess_qwen_inputs_in_collate: true
 
 
 trainer:
@@ -97,7 +101,9 @@ trainer:
   weight_decay: 0.0
   logging_frequency: 10
   gradient_clipping: 1.0
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 8
+  pretrained_checkpoint: /home/WangBizi/VLA-JEPA/checkpoints/cotrain/checkpoints/steps_2500_pytorch_model.pt
+  ignore_mismatched_pretrained: true
   
 
   optimizer:
@@ -112,3 +118,4 @@ trainer:
   resume_step: null
   enable_gradient_checkpointing: true
   enable_mixed_precision_training: true
+  enable_detailed_timing: false

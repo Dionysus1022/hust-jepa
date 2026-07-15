@@ -19,6 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 from typing import Tuple
 from torch.utils.data import DataLoader
@@ -31,7 +32,7 @@ import torch.distributed as dist
 import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import GradientAccumulationPlugin, set_seed
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import AutoProcessor, get_scheduler
@@ -42,9 +43,20 @@ from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
 from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-accelerator.print(accelerator.state)
+def create_accelerator(cfg) -> Accelerator:
+    grad_accum_steps = int(getattr(cfg.trainer, "gradient_accumulation_steps", 1))
+    grad_accum_plugin = GradientAccumulationPlugin(
+        num_steps=grad_accum_steps,
+        sync_each_batch=False,
+    )
+    deepspeed_plugin = DeepSpeedPlugin()
+    accelerator = Accelerator(
+        deepspeed_plugin=deepspeed_plugin,
+        gradient_accumulation_plugin=grad_accum_plugin,
+    )
+    accelerator.print(accelerator.state)
+    accelerator.print(f"Using gradient_accumulation_steps={accelerator.gradient_accumulation_steps}")
+    return accelerator
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -136,6 +148,107 @@ class VLAMTrainer(TrainerUtils):
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
 
+    def _move_batch_to_device(self, batch):
+        if torch.is_tensor(batch):
+            return batch.to(self.accelerator.device, non_blocking=True)
+        if batch.__class__.__name__ == "BatchFeature":
+            return batch.to(self.accelerator.device)
+        if isinstance(batch, dict):
+            has_preprocessed_vj = "vj_pixel_values_videos" in batch
+            has_preprocessed_qwen = "qwen_inputs" in batch
+            return {
+                k: v
+                if (has_preprocessed_vj and k == "video") or (has_preprocessed_qwen and k in {"image", "lang"})
+                else self._move_batch_to_device(v)
+                for k, v in batch.items()
+            }
+        if isinstance(batch, tuple):
+            return tuple(self._move_batch_to_device(v) for v in batch)
+        if isinstance(batch, list):
+            return [self._move_batch_to_device(v) for v in batch]
+        return batch
+
+    def _as_collated_dict(self, batch):
+        if isinstance(batch, dict):
+            return batch
+        videos_np = np.stack([example["video"] for example in batch])
+        collated = {
+            "image": [example["image"] for example in batch],
+            "lang": [example["lang"] for example in batch],
+            "video": torch.from_numpy(videos_np),
+        }
+        if "action" in batch[0]:
+            collated["action"] = torch.from_numpy(np.stack([example["action"] for example in batch]))
+        if "state" in batch[0]:
+            collated["state"] = torch.from_numpy(np.stack([example["state"] for example in batch]))
+        return collated
+
+    def _get_qwen_pad_token_id(self):
+        model = getattr(self.model, "module", self.model)
+        qwen = getattr(model, "qwen_vl_interface", None)
+        processor = getattr(qwen, "processor", None)
+        tokenizer = getattr(processor, "tokenizer", None)
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        return 0 if pad_token_id is None else pad_token_id
+
+    def _concat_preprocessed_qwen_inputs(self, qwen_inputs_list):
+        qwen_inputs_list = [item for item in qwen_inputs_list if item is not None]
+        if len(qwen_inputs_list) <= 1:
+            return qwen_inputs_list[0] if qwen_inputs_list else None
+
+        batch_sizes = [inputs["input_ids"].shape[0] for inputs in qwen_inputs_list]
+        max_seq_len = max(inputs["input_ids"].shape[1] for inputs in qwen_inputs_list)
+        pad_token_id = self._get_qwen_pad_token_id()
+
+        merged = {}
+        keys = set().union(*(inputs.keys() for inputs in qwen_inputs_list))
+        for key in keys:
+            values = [inputs[key] for inputs in qwen_inputs_list if key in inputs]
+            if not values or not torch.is_tensor(values[0]):
+                continue
+
+            if values[0].dim() == 2 and all(v.shape[0] == b for v, b in zip(values, batch_sizes)):
+                pad_value = pad_token_id if key == "input_ids" else (-100 if key == "labels" else 0)
+                padded_values = []
+                for value in values:
+                    pad_len = max_seq_len - value.shape[1]
+                    if pad_len > 0:
+                        pad = value.new_full((value.shape[0], pad_len), pad_value)
+                        value = torch.cat([pad, value], dim=1)
+                    padded_values.append(value)
+                merged[key] = torch.cat(padded_values, dim=0)
+            else:
+                merged[key] = torch.cat(values, dim=0)
+        return merged
+
+    def _merge_cotrain_batches(self, batch_vla, batch_vlm):
+        batch_vla = self._as_collated_dict(batch_vla)
+        batch_vlm = self._as_collated_dict(batch_vlm)
+        vla_video = batch_vla["video"]
+        vlm_video = batch_vlm["video"]
+
+        mixed = {
+            "image": batch_vla["image"] + batch_vlm["image"],
+            "lang": batch_vla["lang"] + batch_vlm["lang"],
+            "video": torch.cat([vla_video, vlm_video], dim=0),
+            "action": batch_vla["action"],
+            "vla_batch_size": len(batch_vla["lang"]),
+            "vlm_batch_size": len(batch_vlm["lang"]),
+        }
+        if "state" in batch_vla:
+            mixed["state"] = batch_vla["state"]
+        qwen_inputs = [batch.get("qwen_inputs", None) for batch in (batch_vla, batch_vlm)]
+        if any(item is not None for item in qwen_inputs):
+            mixed["qwen_inputs"] = (
+                self._concat_preprocessed_qwen_inputs(qwen_inputs)
+                if all(item is not None for item in qwen_inputs)
+                else qwen_inputs
+            )
+        vj_inputs = [batch.get("vj_pixel_values_videos", None) for batch in (batch_vla, batch_vlm)]
+        if any(item is not None for item in vj_inputs):
+            mixed["vj_pixel_values_videos"] = vj_inputs
+        return mixed
+
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
@@ -217,7 +330,7 @@ class VLAMTrainer(TrainerUtils):
     def _save_checkpoint(self):
         """save current training state"""
 
-        if accelerator.is_main_process:
+        if self.accelerator.is_main_process:
 
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
             # save model state
@@ -231,7 +344,7 @@ class VLAMTrainer(TrainerUtils):
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
             self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
-        accelerator.wait_for_everyone()
+        self.accelerator.wait_for_everyone()
 
     def _log_metrics(self, metrics):
         """record training metrics"""
@@ -301,30 +414,63 @@ class VLAMTrainer(TrainerUtils):
         # main training loop
         while self.completed_steps < self.config.trainer.max_train_steps:
             # get data batch
+            t_start_data = time.perf_counter()
             batch_vla, batch_vlm = self._get_next_batch()
+            t_end_fetch = time.perf_counter()
+            t_start_h2d = time.perf_counter()
+            batch_mixed = self._merge_cotrain_batches(batch_vla, batch_vlm)
+            batch_mixed = self._move_batch_to_device(batch_mixed)
+            if self.config.trainer.get("enable_detailed_timing", False) and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_end_data = time.perf_counter()
 
             # execute training step
-            step_metrics = self._train_step(batch_vla, batch_vlm)
+            t_start_model = time.perf_counter()
+            step_metrics = self._train_step(batch_mixed)
+            t_end_model = time.perf_counter()
 
             # update progress
-            if self.accelerator.sync_gradients:
+            is_update_step = step_metrics.pop("is_update_step", True)
+            if is_update_step:
+                self.lr_scheduler.step()
                 progress_bar.update(1)
                 self.completed_steps += 1
 
-            # evaluate model
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+            if is_update_step:
+                # evaluate model
+                if self.completed_steps % self.config.trainer.eval_interval == 0:
+                    step_metrics = self.eval_action_model(step_metrics)
 
-            # record metrics
-            self._log_metrics(step_metrics)
+                # record metrics
+                step_metrics["data_time"] = t_end_data - t_start_data
+                step_metrics["data_fetch_time"] = t_end_fetch - t_start_data
+                step_metrics["batch_h2d_time"] = t_end_data - t_start_h2d
+                step_metrics["model_time"] = t_end_model - t_start_model
+                self._log_metrics(step_metrics)
 
-            # save checkpoint
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
-                self._save_checkpoint()
+                # save checkpoint
+                if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+                    self._save_checkpoint()
 
-                dist.barrier()  # ensure all processes are synchronized, avoid timeout
+                    dist.barrier()  # ensure all processes are synchronized, avoid timeout
 
             # check termination condition
+            if self.accelerator.is_local_main_process:
+                postfix = {
+                    "data_times": f"{t_end_data - t_start_data:.3f}",
+                    "model_times": f"{t_end_model - t_start_model:.3f}",
+                }
+                if self.config.trainer.get("enable_detailed_timing", False):
+                    postfix.update(
+                        {
+                            "mix_fwd": f"{step_metrics.get('timing/mixed_forward_time', 0.0):.3f}",
+                            "bwd": f"{step_metrics.get('timing/backward_grad_sync_time', 0.0):.3f}",
+                            "ds_step": f"{step_metrics.get('timing/deepspeed_step_time', 0.0):.3f}",
+                            "h2d": f"{t_end_data - t_start_h2d:.3f}",
+                        }
+                    )
+                progress_bar.set_postfix(postfix)
+
             if self.completed_steps >= self.config.trainer.max_train_steps:
                 break
 
@@ -347,11 +493,15 @@ class VLAMTrainer(TrainerUtils):
             examples, vlm_data = self._get_next_batch()
 
             score = 0.0
-            num_samples = len(examples)
-
-            batch_images = [example["image"] for example in examples]
-            instructions = [example["lang"] for example in examples]  # [B, str]
-            actions = [example["action"] for example in examples]  # label
+            if isinstance(examples, dict):
+                batch_images = examples["image"]
+                instructions = examples["lang"]
+                actions = examples["action"].detach().cpu().numpy() if torch.is_tensor(examples["action"]) else examples["action"]
+            else:
+                batch_images = [example["image"] for example in examples]
+                instructions = [example["lang"] for example in examples]  # [B, str]
+                actions = [example["action"] for example in examples]  # label
+            num_samples = len(instructions)
 
             # Predict actions using the model
             output_dict = self.model.predict_action(
@@ -385,69 +535,63 @@ class VLAMTrainer(TrainerUtils):
             logger.info(f"  Gradient accumulation steps = {self.config.trainer.gradient_accumulation_steps}")
             logger.info(f"  Total batch size = {self.total_batch_size}")
 
-    def _train_step(self, batch_vla, batch_vlm):
+    def _train_step(self, batch_mixed):
         """execute single training step"""
         log_dict = {}
-        with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
+        detailed_timing = bool(self.config.trainer.get("enable_detailed_timing", False))
+        timing = {}
 
-            # TODO 再出错，mock 小模型查看原因
-            # VLA task forward propagation
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla)
-                total_loss = sum(output_dict.values())
-            
-            self.accelerator.backward(total_loss)
-            # gradient clipping
-            if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+        def sync_cuda():
+            if detailed_timing and torch.cuda.is_available():
+                torch.cuda.synchronize()
 
-            # optimizer step
-            self.optimizer.step()
-            self.lr_scheduler.step()
+        def timed(name, fn):
+            if not detailed_timing:
+                return fn()
+            sync_cuda()
+            start = time.perf_counter()
+            result = fn()
+            sync_cuda()
+            timing[name] = time.perf_counter() - start
+            return result
 
-            self.optimizer.zero_grad()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                vlm_output = self.model.forward(batch_vlm)
-                vlm_loss = sum(vlm_output.values())
+        def get_forward_timing(prefix):
+            if not detailed_timing:
+                return {}
+            wrapped_model = getattr(self.model, "module", self.model)
+            return {
+                f"{prefix}/{k}": v
+                for k, v in getattr(wrapped_model, "last_forward_timing", {}).items()
+            }
 
-            self.accelerator.backward(vlm_loss)
-            # gradient clipping
-            if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output_dict = timed("timing/mixed_forward_time", lambda: self.model.forward(batch_mixed))
+            mixed_forward_timing = get_forward_timing("mixed")
 
-            # optimizer step
-            self.optimizer.step()
-            self.lr_scheduler.step()
+        total_loss = timed("timing/loss_sum_time", lambda: sum(output_dict.values()))
 
-            """
-            self.optimizer.zero_grad()
-            #dist.barrier()  # @DEBUG
-            #pass
-            #============= Step 2
-            # VLM task forward propagation
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                vlm_output = self.model.forward(batch_vlm)
-                vlm_loss = sum(vlm_output.values())
-
-            self.accelerator.backward(vlm_loss)
-
-            #pass
-
-            #dist.barrier() #@DEBUG
-            # gradient clipping
-            if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
-
-            # optimizer step
-            self.optimizer.step()
-            self.lr_scheduler.step()
-            """
+        is_update_step = True
+        if hasattr(self.model, "backward") and hasattr(self.model, "step"):
+            timed("timing/backward_grad_sync_time", lambda: self.model.backward(total_loss))
+            if hasattr(self.model, "is_gradient_accumulation_boundary"):
+                is_update_step = bool(self.model.is_gradient_accumulation_boundary())
+            timed("timing/deepspeed_step_time", self.model.step)
+        else:
+            with self.accelerator.accumulate(self.model):
+                timed("timing/backward_grad_sync_time", lambda: self.accelerator.backward(total_loss))
+                if self.accelerator.sync_gradients and self.config.trainer.gradient_clipping is not None:
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+                timed("timing/optimizer_step_time", self.optimizer.step)
+                self.optimizer.zero_grad()
+                is_update_step = bool(self.accelerator.sync_gradients)
 
         for k, v in output_dict.items():
-            log_dict[f"vla_{k}"] = v.item()
-        for k, v in vlm_output.items():
-            log_dict[f"vlm_{k}"] = v.item()
+            log_dict[k] = v.item()
+        log_dict["loss"] = total_loss.item()
+        log_dict["is_update_step"] = is_update_step
+        if detailed_timing:
+            log_dict.update(mixed_forward_timing)
+            log_dict.update(timing)
         return log_dict
 
     def _finalize_training(self):
@@ -470,7 +614,7 @@ class VLAMTrainer(TrainerUtils):
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 
 
-def main(cfg) -> None:
+def main(cfg, accelerator) -> None:
     logger.info("VLA Training :: Warming Up")
 
     # create output directory and save config
@@ -527,4 +671,5 @@ if __name__ == "__main__":
         )  # you may ask chatGPT what is debugger attach in vscode
         debugpy.wait_for_client()
 
-    main(cfg)
+    accelerator = create_accelerator(cfg)
+    main(cfg, accelerator)

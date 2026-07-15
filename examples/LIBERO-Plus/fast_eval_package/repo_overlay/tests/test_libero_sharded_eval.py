@@ -9,13 +9,24 @@ def _import_sharded_eval_with_stubs(monkeypatch):
     libero_libero = types.ModuleType("libero.libero")
     libero_envs = types.ModuleType("libero.libero.envs")
     model_interface = types.ModuleType("examples.LIBERO.model2libero_interface")
+    imageio = types.ModuleType("imageio")
+    tqdm = types.ModuleType("tqdm")
+    tyro = types.ModuleType("tyro")
+    requests = types.ModuleType("requests")
 
     libero_libero.benchmark = SimpleNamespace(get_benchmark_dict=lambda: {})
     libero_libero.get_libero_path = lambda key: "/unused"
     libero_envs.OffScreenRenderEnv = object
     model_interface.M1Inference = object
+    imageio.mimwrite = lambda *args, **kwargs: None
+    tqdm.tqdm = lambda iterable, *args, **kwargs: iterable
+    tyro.cli = lambda *args, **kwargs: None
     libero_pkg.libero = libero_libero
 
+    monkeypatch.setitem(sys.modules, "imageio", imageio)
+    monkeypatch.setitem(sys.modules, "tqdm", tqdm)
+    monkeypatch.setitem(sys.modules, "tyro", tyro)
+    monkeypatch.setitem(sys.modules, "requests", requests)
     monkeypatch.setitem(sys.modules, "libero", libero_pkg)
     monkeypatch.setitem(sys.modules, "libero.libero", libero_libero)
     monkeypatch.setitem(sys.modules, "libero.libero.envs", libero_envs)
@@ -35,7 +46,7 @@ def test_resolve_task_range_splits_tasks_by_shard(monkeypatch):
     eval_libero = _import_sharded_eval_with_stubs(monkeypatch)
     args = SimpleNamespace(task_start=None, task_end=None, shard_index=2, num_shards=4)
 
-    assert eval_libero.resolve_task_range(num_tasks=10, args=args) == range(6, 8)
+    assert eval_libero.resolve_task_range(num_tasks=10, args=args) == range(2, 10, 4)
 
 
 def test_resolve_task_range_clamps_explicit_end(monkeypatch):

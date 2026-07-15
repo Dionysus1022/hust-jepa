@@ -12,10 +12,11 @@ export FFMPEG_THREADS=1
 export OMP_NUM_THREADS=1
 
 export WANDB_MODE=disabled
-export CUDA_VISIBLE_DEVICES=2,3
+export CUDA_VISIBLE_DEVICES=0,1
 
 accelerate launch \
+  --main_process_port 29511 \
   --config_file ./starVLA/config/deepseeds/deepspeed_zero2.yaml \
   --num_processes 2 \
   ./starVLA/training/train_vlajepa_cotrain.py \
-  --config_yaml ./scripts/config/vlajepa_cotrain.yaml
+  --config_yaml ./scripts/config/vlajepa_cotrain_future.yaml

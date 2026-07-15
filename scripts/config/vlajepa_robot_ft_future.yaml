@@ -1,4 +1,4 @@
-run_id: robot_ft
+run_id: robot_ft_future
 run_root_dir: checkpoints
 seed: 42
 trackers:
@@ -45,6 +45,8 @@ framework:
     num_action_tokens_per_timestep: 8
     embodied_action_token: <|embodied_action|>
     num_embodied_action_tokens_per_instruction: 32
+    enable_future_tokens: true
+    special_future_token: <|future_{}|>
     num_frames: 8
   vlanext_conditioning:
     use_proprio_input_vlm: true
@@ -120,13 +122,14 @@ trainer:
   loss_scale:
     vla: 1.0
     vlm: 0.1
+    future: 0.1
   max_grad_norm: 1.0
   warmup_ratio: 0.1
   weight_decay: 0.0
   logging_frequency: 10000
   gradient_clipping: 1.0
   gradient_accumulation_steps: 2
-  pretrained_checkpoint: /home/WangBizi/VLA-JEPA/checkpoints/cotrain/checkpoints/steps_5000_pytorch_model.pt
+  pretrained_checkpoint: /home/WangBizi/VLA-JEPA/checkpoints/cotrain_future/checkpoints/steps_5000_pytorch_model.pt
   ignore_mismatched_pretrained: true
 
   optimizer:

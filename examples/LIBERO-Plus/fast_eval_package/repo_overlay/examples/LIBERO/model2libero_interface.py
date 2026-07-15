@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections import deque
 from typing import Optional, Sequence
 import os
@@ -27,6 +29,7 @@ class M1Inference:
         image_size: list[int] = [224, 224],
         use_ddim: bool = True,
         num_ddim_steps: int = 10,
+        replan_steps: int = 3,
         adaptive_ensemble_alpha = 0.1,
         host="0.0.0.0",
         port=10095,
@@ -60,6 +63,12 @@ class M1Inference:
 
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
+        self.replan_steps = int(replan_steps)
+        if self.replan_steps <= 0 or self.replan_steps > self.action_chunk_size:
+            raise ValueError(
+                f"replan_steps must be in [1, {self.action_chunk_size}], got {self.replan_steps}"
+            )
+        self.action_plan = deque()
         
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
@@ -77,6 +86,7 @@ class M1Inference:
         self.gripper_action_repeat = 0
         self.sticky_gripper_action = 0.0
         self.previous_gripper_action = None
+        self.action_plan.clear()
 
 
     def step(
@@ -113,16 +123,25 @@ class M1Inference:
         if state is not None:
             vla_input["state"] = [state]  # add batch dim
         
-        action_chunk_size = self.action_chunk_size
-        if step % action_chunk_size == 0:
+        if not self.action_plan:
             response = self.client.infer(vla_input)
+            if not response.get("ok", response.get("status") == "ok"):
+                raise RuntimeError(f"Policy server inference failed: {response.get('error', response)}")
+            if "data" not in response:
+                raise RuntimeError(f"Policy server response missing `data`: {response}")
             # unnormalize the action
             # import ipdb; ipdb.set_trace()
             normalized_actions = response["data"]["normalized_actions"] # B, chunk, D        
             normalized_actions = normalized_actions[0]    
             self.raw_actions = self.unnormalize_actions(normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats)
-        
-        raw_actions = self.raw_actions[step % action_chunk_size][None]    
+            if self.raw_actions.shape[0] < self.replan_steps:
+                raise RuntimeError(
+                    f"Policy returned {self.raw_actions.shape[0]} actions, "
+                    f"but replan_steps={self.replan_steps}"
+                )
+            self.action_plan.extend(self.raw_actions[: self.replan_steps])
+
+        raw_actions = self.action_plan.popleft()[None]
 
         raw_action = {
             "world_vector": np.array(raw_actions[0, :3]),

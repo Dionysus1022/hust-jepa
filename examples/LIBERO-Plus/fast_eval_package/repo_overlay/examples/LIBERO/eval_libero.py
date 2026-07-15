@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import collections
 import dataclasses
 import datetime as dt
@@ -57,6 +59,8 @@ class Args:
     benchmark_mode: str = "libero"  # libero rejects LIBERO-plus expanded suites; libero_plus allows them.
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    max_steps: int | None = None  # Optional policy-step limit override.
+    replan_steps: int = 3  # Execute this many actions from each predicted chunk before replanning.
     category_value: str = "Background Textures"
             #Background Textures
         #Camera Viewpoints
@@ -114,17 +118,22 @@ def eval_libero(args: Args) -> None:
         max_steps = 400  # longest training demo has 373 steps
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
+    if args.max_steps is not None:
+        max_steps = args.max_steps
+    logging.info("Max policy steps per episode: %s", max_steps)
 
     model = M1Inference(
         policy_ckpt_path=args.pretrained_path, # to get unnormalization stats
         host=args.host,
         port=args.port,
         image_size=args.resize_size,
+        replan_steps=args.replan_steps,
     )
 
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    successful_completion_steps = []
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task
         task = task_suite.get_task(task_id)
@@ -239,6 +248,16 @@ def eval_libero(args: Args) -> None:
                 if done:
                     task_successes += 1
                     total_successes += 1
+                    completion_steps = step + 1
+                    successful_completion_steps.append(completion_steps)
+                    avg_completion_steps = float(np.mean(successful_completion_steps))
+                    logging.info(
+                        "Successful episode completed in %d policy steps; "
+                        "running successful-episode average: %.2f policy steps over %d successes",
+                        completion_steps,
+                        avg_completion_steps,
+                        len(successful_completion_steps),
+                    )
                     break
                 t += 1
                 step += 1
@@ -266,6 +285,12 @@ def eval_libero(args: Args) -> None:
             logging.info(
                 f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)"
             )
+            if successful_completion_steps:
+                logging.info(
+                    "Average successful completion steps so far: %.2f over %d successes",
+                    float(np.mean(successful_completion_steps)),
+                    len(successful_completion_steps),
+                )
 
         # Log final results
         logging.info(
@@ -279,6 +304,12 @@ def eval_libero(args: Args) -> None:
         f"Total success rate: {float(total_successes) / float(total_episodes)}"
     )
     logging.info(f"Total episodes: {total_episodes}")
+    if successful_completion_steps:
+        logging.info(
+            "Final average successful completion steps: %.2f over %d successes",
+            float(np.mean(successful_completion_steps)),
+            len(successful_completion_steps),
+        )
 
 
 def _validate_benchmark_mode(task_suite, args) -> None:

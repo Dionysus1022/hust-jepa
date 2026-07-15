@@ -1,5 +1,5 @@
 export MASTER_ADDR=127.0.0.1
-export MASTER_PORT=29501
+export MASTER_PORT=29512
 
 export TORCHINDUCTOR_COMPILE_THREADS=4
 export MAX_JOBS=4
@@ -24,5 +24,5 @@ accelerate launch \
   --config_file ./starVLA/config/deepseeds/deepspeed_zero2.yaml \
   --num_processes 2 \
   ./starVLA/training/train_starvla.py \
-  --config_yaml ./scripts/config/vlajepa_robot_ft.yaml
+  --config_yaml ./scripts/config/vlajepa_robot_ft_future.yaml
   

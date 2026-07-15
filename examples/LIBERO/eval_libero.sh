@@ -16,7 +16,7 @@ export sim_python=/home/WangBizi/miniconda3/envs/libero/bin/python
 export MUJOCO_GL=egl
 
 # ===== checkpoint 配置 =====
-your_ckpt=/home/WangBizi/VLA-JEPA/checkpoints/robot_ft/checkpoints/steps_10000_pytorch_model.pt
+your_ckpt=/home/WangBizi/VLA-JEPA/checkpoints/robot_ft/final_model/pytorch_model.pt
 
 folder_name=$(echo "$your_ckpt" | awk -F'/' '{print $(NF-2)"_"$(NF-1)"_"$NF}')
 

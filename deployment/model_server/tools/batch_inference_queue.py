@@ -211,6 +211,13 @@ class BatchInferenceQueue:
                 offset += request_size
         except Exception as exc:
             logging.exception("Batched policy inference failed")
+            try:
+                import torch
+
+                if isinstance(exc, torch.cuda.OutOfMemoryError):
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
             for request in pending:
                 if not request.future.cancelled():
                     request.future.set_exception(exc)
