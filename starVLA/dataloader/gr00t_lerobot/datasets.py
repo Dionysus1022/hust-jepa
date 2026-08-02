@@ -51,6 +51,7 @@ from starVLA.dataloader.gr00t_lerobot.schema import (
     LeRobotStateActionMetadata,
 )
 from starVLA.dataloader.gr00t_lerobot.transform import ComposedModalityTransform
+from starVLA.libero_proprio import droid_state_8d_to_proprio_7d, libero_state_8d_to_normalized_proprio
 
 from functools import partial
 from typing import Tuple, List
@@ -1416,6 +1417,7 @@ class LeRobotMixtureDataset(Dataset):
         self.with_state = with_state
         self.resolution_size = resolution_size
         self.video_resolution_size = video_resolution_size
+        self._bad_steps = set()
 
         # Set properties for sampling
 
@@ -1576,6 +1578,20 @@ class LeRobotMixtureDataset(Dataset):
         
         return resized_video
 
+    @staticmethod
+    def _to_libero_vlanext_proprio(state: np.ndarray) -> np.ndarray:
+        """Convert LIBERO 8D EEF state history to normalized 7D proprio history."""
+        if state.shape[-1] != 8:
+            return state
+        return libero_state_8d_to_normalized_proprio(state).astype(state.dtype, copy=False)
+
+    @staticmethod
+    def _to_droid_vlanext_proprio(state: np.ndarray) -> np.ndarray:
+        """Convert DROID 8D EEF state history to 7D proprio by dropping the pad slot."""
+        if state.shape[-1] != 8:
+            return state
+        return droid_state_8d_to_proprio_7d(state).astype(state.dtype, copy=False)
+
     def __getitem__(self, index: int) -> dict:
         """Get the data for a single trajectory and start index.
 
@@ -1589,8 +1605,12 @@ class LeRobotMixtureDataset(Dataset):
         last_exception = None
         
         for attempt in range(max_retries):
+            sampled_key = None
             try:
                 dataset, trajectory_name, step = self.sample_step(index)
+                sampled_key = (id(dataset), trajectory_name, int(step))
+                if sampled_key in self._bad_steps:
+                    raise RuntimeError(f"Skipping previously failed sample {trajectory_name}:{step}")
                 data = dataset.transforms(dataset.get_step_data(trajectory_name, step))    # video T = 1, action T = horizon
                 
                 # Process all video keys dynamically
@@ -1622,7 +1642,22 @@ class LeRobotMixtureDataset(Dataset):
                     for state_key in dataset.modality_keys["state"]:
                         state.append(data[state_key])
                     state = np.concatenate(state, axis=1).astype(np.float16)
-                    return_dict["state"] = state[0:1]
+                    dataset_name = dataset.dataset_name.lower()
+                    is_libero_dataset = "libero" in dataset_name
+                    is_droid_dataset = "droid" in dataset_name
+                    if (
+                        is_libero_dataset
+                        and "state.pad" in dataset.modality_keys["state"]
+                        and "state.gripper" in dataset.modality_keys["state"]
+                    ):
+                        state = self._to_libero_vlanext_proprio(state).astype(np.float16)
+                    elif (
+                        is_droid_dataset
+                        and "state.pad" in dataset.modality_keys["state"]
+                        and "state.gripper" in dataset.modality_keys["state"]
+                    ):
+                        state = self._to_droid_vlanext_proprio(state).astype(np.float16)
+                    return_dict["state"] = state
                 #print(videos[0].shape) #[horizon, H, W, 3]
                 #print(action.shape) #[horizon, action_dim]
                 #print(images[0]) #PIL.Image
@@ -1634,6 +1669,8 @@ class LeRobotMixtureDataset(Dataset):
                 
             except Exception as e:
                 last_exception = e
+                if sampled_key is not None and "Skipping previously failed sample" not in str(e):
+                    self._bad_steps.add(sampled_key)
                 if attempt < max_retries - 1:
                     # Log the error but continue trying
                     print(f"Attempt {attempt + 1}/{max_retries} failed for index {index}: {e}")
@@ -2123,6 +2160,3 @@ class LeRobotMixtureDataset(Dataset):
                 dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
         
         print(f"Applied cached statistics for {len(self.merged_metadata)} embodiment tags.")
-
-
-

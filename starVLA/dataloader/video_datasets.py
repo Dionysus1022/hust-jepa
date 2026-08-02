@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import random
+import time
 import torch
 import cv2
 import numpy as np
@@ -43,6 +44,19 @@ def _get_qwen_processor(model_path, action_tokens, embodied_action_token, future
             _QWEN_PROCESSOR.tokenizer.add_tokens([embodied_action_token], special_tokens=True)
         _QWEN_PROCESSOR_PATH = model_path
     return _QWEN_PROCESSOR
+
+
+def _process_vj_videos(processor, videos):
+    try:
+        return processor(videos=videos, return_tensors="pt")["pixel_values_videos"]
+    except Exception:
+        return torch.cat(
+            [
+                processor(videos=videos[i], return_tensors="pt")["pixel_values_videos"]
+                for i in range(videos.shape[0])
+            ],
+            dim=0,
+        )
 
 def random_crop_or_pad(video, target_h, target_w, pad_value=0):
     """
@@ -114,15 +128,20 @@ def collate_fn(
     for b in batch:
         video, instruction = b[0], b[1]
         images.append([Image.fromarray(video[0]).resize((resolution_size, resolution_size))])
-        videos.append(np.stack([video.copy() for _ in range(n_views)], axis=0))  # [V, T, H, W, C]
+        videos.append(video)
         instructions.append(instruction)
 
-    videos_np = np.stack(videos)  # [B, V, T, H, W, C]
+    single_view_videos_np = np.stack(videos)  # [B, T, H, W, C]
+    B, T, H, W, C = single_view_videos_np.shape
     collated = {
         "image": images,
-        "video": torch.from_numpy(videos_np),
+        "video": None,
+        "video_shape": (B, n_views, T, C, H, W),
         "lang": instructions,
     }
+    if not preprocess_vj_inputs:
+        videos_np = np.repeat(single_view_videos_np[:, None], n_views, axis=1)  # [B, V, T, H, W, C]
+        collated["video"] = torch.from_numpy(videos_np)
 
     if preprocess_qwen_inputs:
         if not qwen_processor_path:
@@ -158,14 +177,9 @@ def collate_fn(
         if not vj_processor_path:
             raise ValueError("vj_processor_path is required when preprocess_vj_inputs=True")
         processor = _get_vj_processor(vj_processor_path)
-        videos_for_processor = videos_np.transpose(0, 1, 2, 5, 3, 4)  # [B, V, T, C, H, W]
-        B, V, T, C, H, W = videos_for_processor.shape
-        videos_for_processor = videos_for_processor.reshape(B * V, T, C, H, W)
-        processed = [
-            processor(videos=videos_for_processor[i], return_tensors="pt")["pixel_values_videos"]
-            for i in range(B * V)
-        ]
-        collated["vj_pixel_values_videos"] = torch.cat(processed, dim=0)
+        videos_for_processor = single_view_videos_np.transpose(0, 1, 4, 2, 3)  # [B, T, C, H, W]
+        processed = _process_vj_videos(processor, videos_for_processor)
+        collated["vj_pixel_values_videos"] = processed.repeat_interleave(n_views, dim=0)
 
     return collated
 
@@ -179,12 +193,17 @@ class VideoFolderDataset(Dataset):
         crop_h_size=420,
         crop_w_size=240,
         max_retry: int = 10,
+        decode_threads: int = 1,
     ):
         self.video_dir = video_dir
         self.n_frames = n_frames
         self.max_retry = max_retry
         self.crop_h_size = crop_h_size
         self.crop_w_size = crop_w_size
+        self.decode_threads = max(int(decode_threads), 0)
+        self.slow_video_warn_sec = float(os.environ.get("VLAJEPA_SLOW_VIDEO_WARN_SEC", "3.0"))
+        self.skip_slow_videos = os.environ.get("VLAJEPA_SKIP_SLOW_VIDEO", "1") != "0"
+        self._slow_video_files = set()
 
         # 只扫描文件名
         self.video_files = [
@@ -204,48 +223,87 @@ class VideoFolderDataset(Dataset):
 
     def __len__(self):
         return len(self.video_files)
+
+    def _open_video_capture(self, video_path):
+        if self.decode_threads > 0 and hasattr(cv2, "CAP_PROP_N_THREADS"):
+            try:
+                cap = cv2.VideoCapture(
+                    video_path,
+                    cv2.CAP_FFMPEG,
+                    [cv2.CAP_PROP_N_THREADS, self.decode_threads],
+                )
+                if cap.isOpened():
+                    return cap
+                cap.release()
+            except Exception:
+                pass
+        return cv2.VideoCapture(video_path)
     
     def _load_video(self, idx):
+        load_start = time.perf_counter()
         file_idx = int(self.video_files[idx].split(".")[0])
         video_path = os.path.join(self.video_dir, self.video_files[idx])
 
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError("无法打开视频")
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap = self._open_video_capture(video_path)
+        try:
+            if not cap.isOpened():
+                raise RuntimeError(f"Unable to open video: {video_path}")
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        if frame_count < self.n_frames:
-            raise ValueError(f"Video {video_path} has only {frame_count} frames, which is less than the required {self.n_frames} frames.")
+            if frame_count < self.n_frames:
+                raise ValueError(f"Video {video_path} has only {frame_count} frames, which is less than the required {self.n_frames} frames.")
 
-        start = random.randint(0, frame_count - self.n_frames)
+            start = random.randint(0, frame_count - self.n_frames)
 
-        frames = []
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-        for frame_offset in range(self.n_frames):
-            ret, frame = cap.read()
-            if not ret:
-                raise ValueError(f"Unable to read frame at index {start + frame_offset}")
-            frames.append(frame)
-        cap.release()
-        #frames = random_crop_or_pad(
-        #    np.array(frames),
-        #    target_h=self.crop_h_size,
-        #    target_w=self.crop_w_size,
-        #    pad_value=0)
+            frames = []
+            seek_start = time.perf_counter()
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            seek_time = time.perf_counter() - seek_start
+            read_start = time.perf_counter()
+            for frame_offset in range(self.n_frames):
+                ret, frame = cap.read()
+                if not ret:
+                    raise ValueError(f"Unable to read frame at index {start + frame_offset} from {video_path}")
+                # OpenCV decodes frames as BGR, while PIL/Qwen/V-JEPA processors expect RGB.
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(frame)
+            read_time = time.perf_counter() - read_start
+        finally:
+            cap.release()
+
+        resize_start = time.perf_counter()
         frames = resize_video(
             np.array(frames),
             target_h=self.crop_h_size,
             target_w=self.crop_w_size)
+        resize_time = time.perf_counter() - resize_start
+        total_time = time.perf_counter() - load_start
+        if total_time >= self.slow_video_warn_sec:
+            print(
+                f"[slow_video_load] {total_time:.3f}s "
+                f"seek={seek_time:.3f}s read={read_time:.3f}s resize={resize_time:.3f}s "
+                f"frames={frame_count} start={start} path={video_path}",
+                flush=True,
+            )
+            if self.skip_slow_videos:
+                self._slow_video_files.add(self.video_files[idx])
 
         #print(frames.shape, video_path, file_idx, file_idx in self.id2text.keys())
 
         return [frames, self.id2text[file_idx]]
 
     def __getitem__(self, idx):
+        last_error = None
         for _ in range(self.max_retry):
             try:
+                if self.skip_slow_videos and self.video_files[idx] in self._slow_video_files:
+                    idx = random.randint(0, len(self.video_files) - 1)
+                    continue
                 return self._load_video(idx)
             except Exception as e:
+                last_error = e
                 idx = random.randint(0, len(self.video_files) - 1)
 
+        if last_error is not None:
+            print(f"[video_load_retry_exhausted] last_error={last_error}", flush=True)
         return self._load_video(2)

@@ -138,6 +138,13 @@ class _QWen3_VL_Interface(nn.Module):
         model.config.use_cache = False
         if hasattr(model.config, "text_config"):
             model.config.text_config.use_cache = False
+        trainer_cfg = config.trainer if hasattr(config, "trainer") else {}
+        if trainer_cfg.get("enable_gradient_checkpointing", False) and hasattr(model, "gradient_checkpointing_enable"):
+            try:
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                model.gradient_checkpointing_enable()
+            logger.info("Enabled gradient checkpointing for Qwen VLM")
 
         self.model = model
         self.processor = processor

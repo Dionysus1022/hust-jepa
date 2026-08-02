@@ -17,7 +17,7 @@ framework:
     add_pos_embed: true
     max_seq_len: 1024
     action_dim: 7
-    state_dim: 8
+    state_dim: 7
     future_action_window_size: 6
     action_horizon: 7
     past_action_window_size: 0
@@ -74,6 +74,10 @@ datasets:
     with_state: true
     preprocess_vj_inputs_in_collate: true
     preprocess_qwen_inputs_in_collate: true
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
     augmentation:
       enabled: true
       random_resized_crop:

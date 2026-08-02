@@ -226,25 +226,51 @@ class VLAMTrainer(TrainerUtils):
         batch_vlm = self._as_collated_dict(batch_vlm)
         vla_video = batch_vla["video"]
         vlm_video = batch_vlm["video"]
+        qwen_inputs = [batch.get("qwen_inputs", None) for batch in (batch_vla, batch_vlm)]
+        vj_inputs = [batch.get("vj_pixel_values_videos", None) for batch in (batch_vla, batch_vlm)]
+
+        has_full_vj_inputs = all(item is not None for item in vj_inputs)
+        def channel_first_video_shape(batch, video):
+            if torch.is_tensor(video):
+                B, V, T, H, W, C = video.shape
+                return (int(B), int(V), int(T), int(C), int(H), int(W))
+            if "video_shape" in batch:
+                return tuple(int(x) for x in batch["video_shape"])
+            return None
+
+        vla_video_shape = channel_first_video_shape(batch_vla, vla_video)
+        vlm_video_shape = channel_first_video_shape(batch_vlm, vlm_video)
+        can_drop_raw_video = (
+            has_full_vj_inputs
+            and vla_video_shape is not None
+            and vlm_video_shape is not None
+            and tuple(vla_video_shape[1:]) == tuple(vlm_video_shape[1:])
+        )
 
         mixed = {
             "image": batch_vla["image"] + batch_vlm["image"],
             "lang": batch_vla["lang"] + batch_vlm["lang"],
-            "video": torch.cat([vla_video, vlm_video], dim=0),
             "action": batch_vla["action"],
             "vla_batch_size": len(batch_vla["lang"]),
             "vlm_batch_size": len(batch_vlm["lang"]),
         }
+        if can_drop_raw_video:
+            total_batch = int(vla_video_shape[0] + vlm_video_shape[0])
+            _, V, T, C, H, W = vla_video_shape
+            mixed["video"] = None
+            mixed["video_shape"] = (total_batch, V, T, C, H, W)
+        else:
+            if vla_video is None or vlm_video is None:
+                raise RuntimeError("Raw videos are required when VJ inputs are not fully preprocessed.")
+            mixed["video"] = torch.cat([vla_video, vlm_video], dim=0)
         if "state" in batch_vla:
             mixed["state"] = batch_vla["state"]
-        qwen_inputs = [batch.get("qwen_inputs", None) for batch in (batch_vla, batch_vlm)]
         if any(item is not None for item in qwen_inputs):
             mixed["qwen_inputs"] = (
                 self._concat_preprocessed_qwen_inputs(qwen_inputs)
                 if all(item is not None for item in qwen_inputs)
                 else qwen_inputs
             )
-        vj_inputs = [batch.get("vj_pixel_values_videos", None) for batch in (batch_vla, batch_vlm)]
         if any(item is not None for item in vj_inputs):
             mixed["vj_pixel_values_videos"] = vj_inputs
         return mixed
@@ -254,15 +280,10 @@ class VLAMTrainer(TrainerUtils):
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
         set_seed(seed)
 
-        # load pretrained weights
-        if hasattr(self.config.trainer, "pretrained_checkpoint") and self.config.trainer.pretrained_checkpoint:
-            pretrained_checkpoint = self.config.trainer.pretrained_checkpoint
-            reload_modules = (
-                self.config.trainer.reload_modules if hasattr(self.config.trainer, "reload_modules") else None
-            )
-            ignore_mismatched_sizes = bool(
-                getattr(self.config.trainer, "ignore_mismatched_pretrained", False)
-            )
+        pretrained_checkpoint = self.config.trainer.get("pretrained_checkpoint", None)
+        if pretrained_checkpoint:
+            reload_modules = self.config.trainer.get("reload_modules", None)
+            ignore_mismatched_sizes = bool(self.config.trainer.get("ignore_mismatched_pretrained", False))
             self.model = self.load_pretrained_backbones(
                 self.model,
                 pretrained_checkpoint,
@@ -270,16 +291,8 @@ class VLAMTrainer(TrainerUtils):
                 ignore_mismatched_sizes=ignore_mismatched_sizes,
             )
 
-        # freeze parameters
-        freeze_modules = (
-            self.config.trainer.freeze_modules
-            if (self.config and hasattr(self.config.trainer, "freeze_modules"))
-            else None
-        )
-        self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
-
-        #  print trainable parameters of the model
-        self.print_trainable_parameters(self.model)
+        if not self.config.trainer.get("_model_frozen_before_optimizer", False):
+            self.model = self.freeze_model_for_optimizer(self.model, self.config)
 
         # initialize distributed training components
         self.model, self.optimizer, self.vla_train_dataloader, self.video_train_dataloader = (
@@ -368,12 +381,57 @@ class VLAMTrainer(TrainerUtils):
                 # record to W&B
                 #wandb.log(metrics, step=self.completed_steps)
                 # debug output
-                logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+                log_full_metrics = bool(self.config.trainer.get("log_full_metrics", False))
+                if log_full_metrics:
+                    logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+                    return
+
+                log_keys = [
+                    "loss",
+                    "action_loss",
+                    "wm_loss",
+                    "future_token_loss",
+                    "action_dct_loss",
+                    "data_time",
+                    "model_time",
+                    "timing/mixed_forward_time",
+                    "timing/backward_grad_sync_time",
+                    "timing/deepspeed_step_time",
+                    "learning_rate",
+                    "epoch",
+                ]
+                compact_metrics = {}
+                for key in log_keys:
+                    if key not in metrics:
+                        continue
+                    value = metrics[key]
+                    compact_metrics[key] = round(float(value), 6) if isinstance(value, (int, float)) else value
+                logger.info(f"Step {self.completed_steps}, Metrics: {compact_metrics}")
 
     def _create_data_iterators(self):
         """create data iterators"""
         self.vla_iter = iter(self.vla_train_dataloader)
         self.vlm_iter = iter(self.video_train_dataloader)
+
+    def _warmup_data_iterators(self):
+        """Prime dataloader workers so processor construction and first prefetches happen outside timed steps."""
+        trainer_cfg = getattr(self.config, "trainer", {})
+        default_warmup_steps = max(
+            int(self.config.datasets.vla_data.get("num_workers", 0)),
+            int(self.config.datasets.video_data.get("num_workers", 0)),
+            1,
+        )
+        warmup_steps = int(trainer_cfg.get("dataloader_warmup_steps", default_warmup_steps))
+        if warmup_steps <= 0:
+            return
+
+        if self.accelerator.is_local_main_process:
+            logger.info(f"Warming up dataloaders for {warmup_steps} batches per rank...")
+        for _ in range(warmup_steps):
+            batch_vla, batch_vlm = self._get_next_batch()
+            del batch_vla, batch_vlm
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
     def _get_next_batch(self):
         """get next batch (automatically handle data loop)"""
@@ -398,6 +456,37 @@ class VLAMTrainer(TrainerUtils):
 
         return batch_vla, batch_vlm
 
+    def _add_distributed_timing_stats(self, step_metrics):
+        if not (dist.is_available() and dist.is_initialized()):
+            return step_metrics
+
+        timing_keys = [
+            "data_time",
+            "data_fetch_time",
+            "batch_h2d_time",
+            "model_time",
+            "timing/mixed_forward_time",
+            "timing/backward_grad_sync_time",
+            "timing/deepspeed_step_time",
+            "mixed/forward/qwen_build_inputs_h2d_time",
+            "mixed/forward/vj_processor_h2d_time",
+        ]
+        device = self.accelerator.device
+        world_size = dist.get_world_size()
+        for key in timing_keys:
+            if key not in step_metrics:
+                continue
+            local_value = torch.tensor(float(step_metrics[key]), device=device)
+            gathered = [torch.zeros_like(local_value) for _ in range(world_size)]
+            dist.all_gather(gathered, local_value)
+            values = torch.stack(gathered)
+            max_value, max_rank = values.max(dim=0)
+            min_value = values.min()
+            step_metrics[f"{key}/rank_max"] = max_value.item()
+            step_metrics[f"{key}/rank_min"] = min_value.item()
+            step_metrics[f"{key}/rank_max_id"] = int(max_rank.item())
+        return step_metrics
+
     def train(self):
         """execute training loop"""
         # print training config
@@ -405,6 +494,7 @@ class VLAMTrainer(TrainerUtils):
 
         # prepare data iterators
         self._create_data_iterators()
+        self._warmup_data_iterators()
 
         # create progress bar
         progress_bar = tqdm(
@@ -425,8 +515,12 @@ class VLAMTrainer(TrainerUtils):
             t_end_data = time.perf_counter()
 
             # execute training step
+            if self.config.trainer.get("enable_detailed_timing", False) and torch.cuda.is_available():
+                torch.cuda.synchronize()
             t_start_model = time.perf_counter()
             step_metrics = self._train_step(batch_mixed)
+            if self.config.trainer.get("enable_detailed_timing", False) and torch.cuda.is_available():
+                torch.cuda.synchronize()
             t_end_model = time.perf_counter()
 
             # update progress
@@ -446,6 +540,8 @@ class VLAMTrainer(TrainerUtils):
                 step_metrics["data_fetch_time"] = t_end_fetch - t_start_data
                 step_metrics["batch_h2d_time"] = t_end_data - t_start_h2d
                 step_metrics["model_time"] = t_end_model - t_start_model
+                if self.config.trainer.get("enable_detailed_timing", False):
+                    step_metrics = self._add_distributed_timing_stats(step_metrics)
                 self._log_metrics(step_metrics)
 
                 # save checkpoint
@@ -467,6 +563,8 @@ class VLAMTrainer(TrainerUtils):
                             "bwd": f"{step_metrics.get('timing/backward_grad_sync_time', 0.0):.3f}",
                             "ds_step": f"{step_metrics.get('timing/deepspeed_step_time', 0.0):.3f}",
                             "h2d": f"{t_end_data - t_start_h2d:.3f}",
+                            "qwen_in": f"{step_metrics.get('mixed/forward/qwen_build_inputs_h2d_time', 0.0):.3f}",
+                            "vj_prep": f"{step_metrics.get('mixed/forward/vj_processor_h2d_time', 0.0):.3f}",
                         }
                     )
                 progress_bar.set_postfix(postfix)
@@ -622,6 +720,7 @@ def main(cfg, accelerator) -> None:
 
     # build model
     vla = build_framework(cfg)
+    vla = TrainerUtils.freeze_model_for_optimizer(vla, cfg)
     # prepare data
     vla_train_dataloader, video_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
     # set optimizer and scheduler

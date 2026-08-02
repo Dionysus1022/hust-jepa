@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from starVLA.dataloader.lerobot_datasets import collate_fn
+from starVLA.dataloader.lerobot_datasets import _augment_video_frames, collate_fn
 from starVLA.model.framework.VLA_JEPA import SoftQueryConnector
 
 
@@ -30,29 +30,46 @@ def test_lerobot_collate_keeps_fast_path_when_augmentation_disabled():
     assert len(batch["image"][0]) == 2
 
 
-def test_lerobot_collate_applies_vlanext_style_augmentation():
+def test_lerobot_collate_augments_vla_images_but_keeps_vjepa_video_clean():
     sample = _fake_sample()
+    original_video = sample["video"].copy()
+    original_image = np.asarray(sample["image"][0]).copy()
     augmentation = {
         "enabled": True,
-        "random_resized_crop": {"scale": [0.8, 1.0], "ratio": [0.9, 1.1]},
-        "random_brightness": [0.2],
-        "random_contrast": [0.8, 1.2],
-        "random_saturation": [0.8, 1.2],
-        "random_hue": [0.05],
+        "random_brightness": [0.5, 0.5],
+        "augment_order": ["random_brightness"],
+    }
+
+    batch = collate_fn([sample], augmentation=augmentation)
+
+    assert batch["video"].shape == (1, 2, 4, 32, 32, 3)
+    assert batch["video"].dtype == torch.uint8
+    assert torch.equal(batch["video"][0], torch.from_numpy(original_video))
+    assert not np.array_equal(np.asarray(batch["image"][0][0]), original_image)
+    assert batch["action"].shape == (1, 7, 7)
+
+
+def test_lerobot_image_augmentation_supports_camera_robustness_ops():
+    image = np.full((32, 32, 3), 128, dtype=np.uint8)
+    augmentation = {
+        "enabled": True,
+        "random_gamma": [0.8],
+        "random_exposure_ev": [0.25, 0.25],
+        "gaussian_noise_std": 0.015,
+        "random_rotation_degrees": [8, 8],
         "augment_order": [
-            "random_resized_crop",
-            "random_brightness",
-            "random_contrast",
-            "random_saturation",
-            "random_hue",
+            "random_gamma",
+            "random_exposure_ev",
+            "gaussian_noise",
+            "random_rotation",
         ],
     }
 
-    batch = collate_fn([sample, sample], augmentation=augmentation)
+    augmented = _augment_video_frames(image, augmentation)
 
-    assert batch["video"].shape == (2, 2, 4, 32, 32, 3)
-    assert batch["video"].dtype == torch.uint8
-    assert batch["action"].shape == (2, 7, 7)
+    assert augmented.shape == image.shape
+    assert augmented.dtype == np.uint8
+    assert not np.array_equal(augmented, image)
 
 
 def test_soft_query_connector_uses_embodied_action_tokens_as_query():

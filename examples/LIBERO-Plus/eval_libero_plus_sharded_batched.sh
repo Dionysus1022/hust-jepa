@@ -15,7 +15,7 @@ export sim_python=${sim_python:-/home/WangBizi/miniconda3/envs/libero_plus/bin/p
 export starvla_python=${starvla_python:-/home/WangBizi/miniconda3/envs/VLA_JEPA/bin/python}
 
 your_ckpt=${your_ckpt:-/home/WangBizi/VLA-JEPA/checkpoints/robot_ft/final_model/pytorch_model.pt}
-folder_name=$(echo "$your_ckpt" | awk -F'/' '{print $(NF-2)"_"$(NF-1)"_"$NF}')
+folder_name=${folder_name:-$(echo "$your_ckpt" | awk -F'/' '{print $(NF-2)"_"$(NF-1)"_"$NF}')}
 
 items_str=${items_str:-"Background Textures|Camera Viewpoints|Language Instructions|Light Conditions|Objects Layout|Robot Initial States|Sensor Noise"}
 IFS='|' read -r -a items <<< "$items_str"

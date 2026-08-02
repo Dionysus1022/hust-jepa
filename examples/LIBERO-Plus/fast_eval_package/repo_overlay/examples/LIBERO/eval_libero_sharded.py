@@ -16,11 +16,13 @@ from libero.libero import benchmark
 from examples.LIBERO.eval_libero import (
     LIBERO_DUMMY_ACTION,
     LIBERO_ENV_RESOLUTION,
+    PROPRIO_HISTORY_LEN,
     Args as BaseArgs,
     M1Inference,
     _binarize_gripper_open,
     _get_libero_env,
-    _quat2axisangle,
+    _libero_proprio_state,
+    _proprio_history_array,
     _validate_benchmark_mode,
     short_name,
 )
@@ -125,6 +127,7 @@ def eval_libero(args: Args) -> None:
             step = 0
             replay_images = []
             full_actions = []
+            state_history = collections.deque(maxlen=PROPRIO_HISTORY_LEN)
             done = False
 
             logging.info(f"Starting task {task_id}, episode {task_episodes + 1}...")
@@ -139,18 +142,13 @@ def eval_libero(args: Args) -> None:
                 if args.save_video:
                     replay_images.append(img)
 
-                state = np.concatenate(
-                    (
-                        obs["robot0_eef_pos"],
-                        _quat2axisangle(obs["robot0_eef_quat"]),
-                        obs["robot0_gripper_qpos"],
-                    )
-                )
+                state_history.append(_libero_proprio_state(obs))
+                state = _proprio_history_array(state_history)
 
                 observation = {
                     "observation.primary": np.expand_dims(img, axis=0),
                     "observation.wrist_image": np.expand_dims(wrist_img, axis=0),
-                    "observation.state": np.expand_dims(state, axis=0),
+                    "observation.state": state,
                     "instruction": [str(task_description)],
                 }
                 obs_input = {

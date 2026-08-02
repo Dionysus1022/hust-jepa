@@ -43,7 +43,34 @@ class Task(NamedTuple):
     init_states_file: str
 
 
+def _base_bddl_name_for_language(x):
+    """Return the base BDDL filename whose language should be shown to the policy."""
+    if "_view_" in x:
+        return x.split("_view_")[0] + ".bddl"
+    for pattern in (r"_table_\d+", r"_tb_\d+", r"_light_\d+"):
+        base = re.sub(pattern, "", x)
+        if base != x:
+            return base
+    return x
+
+
+def _language_from_bddl(suite_name, bddl_name):
+    bddl_file_path = os.path.join(
+        get_libero_path("bddl_files"),
+        suite_name,
+        bddl_name,
+    )
+    if not os.path.exists(bddl_file_path):
+        return None
+    problem_info = BDDLUtils.get_problem_info(bddl_file_path)
+    return problem_info["language_instruction"]
+
+
 def grab_language_from_filename(suite_name, x):
+    base_language = _language_from_bddl(suite_name, _base_bddl_name_for_language(x))
+    if base_language is not None:
+        return base_language
+
     if "_language_" not in x:
         if x[0].isupper():  # LIBERO-100
             if "SCENE10" in x:
@@ -55,21 +82,9 @@ def grab_language_from_filename(suite_name, x):
         en = language.find(".bddl")
         return language[:en]
     else:
-        if "_view_" in x:
-            bddl_file_path = os.path.join(
-                get_libero_path("bddl_files"),
-                suite_name,
-                x.split("_view_")[0]+'.bddl',
-            )
-        else:
-            bddl_file_path = os.path.join(
-                get_libero_path("bddl_files"),
-                suite_name,
-                x,
-            )
-        # print("bddl_file_path:", bddl_file_path)
-        problem_info = BDDLUtils.get_problem_info(bddl_file_path)
-        return problem_info["language_instruction"]
+        raise FileNotFoundError(
+            f"Could not resolve base BDDL language for {suite_name}/{x}"
+        )
 
 
 libero_suites = [

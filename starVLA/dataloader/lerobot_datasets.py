@@ -26,6 +26,14 @@ def _sample_range(value, default):
     return float(np.random.uniform(float(value[0]), float(value[1])))
 
 
+def _sample_absolute_range(value, default):
+    if value is None:
+        return default
+    if len(value) == 1:
+        return float(value[0])
+    return float(np.random.uniform(float(value[0]), float(value[1])))
+
+
 def _augment_video_frames(video, augmentation):
     if not augmentation or not augmentation.get("enabled", False):
         return video
@@ -33,7 +41,7 @@ def _augment_video_frames(video, augmentation):
     if not order:
         return video
 
-    from torchvision.transforms import RandomResizedCrop
+    from torchvision.transforms import InterpolationMode, RandomResizedCrop
     from torchvision.transforms import functional as TVF
 
     frames = video
@@ -67,6 +75,30 @@ def _augment_video_frames(video, augmentation):
         else:
             hue = float(np.random.uniform(float(hue_cfg[0]), float(hue_cfg[1])))
         hue = float(np.clip(hue, -0.5, 0.5))
+    gamma = _sample_absolute_range(augmentation.get("random_gamma", None), 1.0)
+    exposure_ev_cfg = augmentation.get("random_exposure_ev", None)
+    exposure_ev = 0.0
+    if exposure_ev_cfg:
+        if len(exposure_ev_cfg) == 1:
+            ev = float(exposure_ev_cfg[0])
+            exposure_ev = float(np.random.uniform(-ev, ev))
+        else:
+            exposure_ev = float(np.random.uniform(float(exposure_ev_cfg[0]), float(exposure_ev_cfg[1])))
+    gaussian_noise_std = float(augmentation.get("gaussian_noise_std", 0.0) or 0.0)
+    rotation_degrees = augmentation.get("random_rotation_degrees", None)
+    rotation_angle = 0.0
+    if rotation_degrees:
+        if len(rotation_degrees) == 1:
+            degrees = float(rotation_degrees[0])
+            rotation_angle = float(np.random.uniform(-degrees, degrees))
+        else:
+            rotation_angle = float(np.random.uniform(float(rotation_degrees[0]), float(rotation_degrees[1])))
+
+    def apply_float_image_op(frame, op):
+        arr = np.asarray(frame).astype(np.float32) / 255.0
+        arr = op(arr)
+        arr = np.clip(arr, 0.0, 1.0)
+        return Image.fromarray((arr * 255.0).round().astype(np.uint8))
 
     out = []
     for frame in pil_frames:
@@ -82,6 +114,23 @@ def _augment_video_frames(video, augmentation):
                 frame = TVF.adjust_saturation(frame, saturation)
             elif op == "random_hue":
                 frame = TVF.adjust_hue(frame, hue)
+            elif op == "random_gamma":
+                frame = apply_float_image_op(frame, lambda arr: np.power(arr, gamma))
+            elif op == "random_exposure_ev":
+                frame = apply_float_image_op(frame, lambda arr: arr * (2.0 ** exposure_ev))
+            elif op == "gaussian_noise" and gaussian_noise_std > 0:
+                frame = apply_float_image_op(
+                    frame,
+                    lambda arr: arr + np.random.normal(0.0, gaussian_noise_std, arr.shape).astype(np.float32),
+                )
+            elif op == "random_rotation" and rotation_degrees:
+                fill = tuple(np.asarray(frame, dtype=np.uint8).reshape(-1, 3).mean(axis=0).round().astype(np.uint8).tolist())
+                frame = TVF.rotate(
+                    frame,
+                    rotation_angle,
+                    interpolation=InterpolationMode.BILINEAR,
+                    fill=fill,
+                )
         out.append(np.asarray(frame, dtype=np.uint8))
     out = np.stack(out, axis=0)
     return out if is_video else out[0]
@@ -92,12 +141,11 @@ def _augment_example(example, augmentation):
         return example["video"], example["image"]
 
     videos = np.asarray(example["video"])
-    aug_videos = np.stack([_augment_video_frames(view, augmentation) for view in videos], axis=0)
     images = []
-    for view_idx, frame in enumerate(aug_videos[:, 0]):
-        target_size = example["image"][view_idx].size if view_idx < len(example["image"]) else (frame.shape[1], frame.shape[0])
-        images.append(Image.fromarray(frame.astype(np.uint8)).resize(target_size))
-    return aug_videos, images
+    for image in example["image"]:
+        aug_image = _augment_video_frames(np.asarray(image), augmentation)
+        images.append(Image.fromarray(aug_image.astype(np.uint8)))
+    return videos, images
 
 
 def _get_vj_processor(processor_path):
@@ -127,6 +175,19 @@ def _get_qwen_processor(model_path, action_tokens, embodied_action_token, future
             _QWEN_PROCESSOR.tokenizer.add_tokens([embodied_action_token], special_tokens=True)
         _QWEN_PROCESSOR_PATH = model_path
     return _QWEN_PROCESSOR
+
+
+def _process_vj_videos(processor, videos):
+    try:
+        return processor(videos=videos, return_tensors="pt")["pixel_values_videos"]
+    except Exception:
+        return torch.cat(
+            [
+                processor(videos=videos[i], return_tensors="pt")["pixel_values_videos"]
+                for i in range(videos.shape[0])
+            ],
+            dim=0,
+        )
 
 
 def collate_fn(
@@ -198,11 +259,9 @@ def collate_fn(
         videos = videos_np.transpose(0, 1, 2, 5, 3, 4)  # [B, V, T, C, H, W]
         B, V, T, C, H, W = videos.shape
         videos = videos.reshape(B * V, T, C, H, W)
-        processed = [
-            processor(videos=videos[i], return_tensors="pt")["pixel_values_videos"]
-            for i in range(B * V)
-        ]
-        collated["vj_pixel_values_videos"] = torch.cat(processed, dim=0)
+        collated["vj_pixel_values_videos"] = _process_vj_videos(processor, videos)
+        collated["video_shape"] = (B, V, T, C, H, W)
+        collated["video"] = None
 
     return collated
 

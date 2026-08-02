@@ -10,6 +10,13 @@ export NCCL_TIMEOUT=1000  # timeout set to 1 hour (unit: seconds)
 export TMPDIR=/home/dataset-local/tmp
 export FFMPEG_THREADS=1
 export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
+export OPENCV_FOR_THREADS_NUM=1
+export MALLOC_ARENA_MAX=2
 
 export WANDB_MODE=disabled
 export CUDA_VISIBLE_DEVICES=0,1

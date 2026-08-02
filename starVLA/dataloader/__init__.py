@@ -14,6 +14,30 @@ from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
 logger = get_logger(__name__)
 
 
+def _worker_init_fn(worker_id):
+    torch.set_num_threads(1)
+    try:
+        import cv2
+
+        cv2.setNumThreads(0)
+    except Exception:
+        pass
+
+
+def _dataloader_kwargs(data_cfg, default_num_workers):
+    num_workers = int(data_cfg.get("num_workers", default_num_workers))
+    kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": bool(data_cfg.get("pin_memory", True)),
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = bool(data_cfg.get("persistent_workers", True))
+        kwargs["prefetch_factor"] = int(data_cfg.get("prefetch_factor", 4))
+        kwargs["worker_init_fn"] = _worker_init_fn
+    logger.info(f"DataLoader kwargs: {kwargs}")
+    return kwargs
+
+
 def _build_jepa_prompt_tokens(cfg, tubelet_size):
     action_tokens = [
         cfg.framework.vj2_model.special_action_token.format(i)
@@ -96,10 +120,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=custom_collate_fn,
-            num_workers=8,
-            pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=4,
+            **_dataloader_kwargs(vla_dataset_cfg, default_num_workers=8),
             # shuffle=True
         )        
         if dist.get_rank() == 0: 
@@ -133,8 +154,8 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=custom_collate_fn,
-            num_workers=16,
             sampler=train_sampler,
+            **_dataloader_kwargs(vla_dataset_cfg, default_num_workers=16),
         )      
         #if dist.get_rank() == 0: 
         #    for batch in vla_train_dataloader:
@@ -161,6 +182,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             crop_h_size=video_dataset_cfg.video_resolution_size,
             crop_w_size=video_dataset_cfg.video_resolution_size,
             max_retry=10,
+            decode_threads=video_dataset_cfg.get("decode_threads", 1),
         )
 
         video_collate_fn = partial(collate_fn, 
@@ -182,7 +204,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             video_dataset,
             batch_size=video_dataset_cfg.per_device_batch_size,
             collate_fn=video_collate_fn,
-            num_workers=16,
             sampler=train_sampler,
+            **_dataloader_kwargs(video_dataset_cfg, default_num_workers=16),
         )        
         return video_train_dataloader

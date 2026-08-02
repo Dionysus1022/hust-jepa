@@ -78,6 +78,8 @@ class VLA_JEPA(baseframework):
         """
         super().__init__()
         self.config = config
+        trainer_cfg = getattr(self.config, "trainer", {})
+        self.enable_gradient_checkpointing = bool(trainer_cfg.get("enable_gradient_checkpointing", False))
         self.qwen_vl_interface = get_vlm_model(config=self.config)
         embodied_action_token = self.config.framework.vj2_model.get("embodied_action_token", "<|embodied_action|>")
         self.use_future_tokens = bool(self.config.framework.vj2_model.get("enable_future_tokens", False))
@@ -114,12 +116,17 @@ class VLA_JEPA(baseframework):
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
 
         self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)  # 修复后续引用
+        if self.enable_gradient_checkpointing and hasattr(getattr(self.action_model, "model", None), "gradient_checkpointing"):
+            self.action_model.model.gradient_checkpointing = True
+            logger.info("Enabled gradient checkpointing for action DiT")
 
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
         
         self.vj_encoder = AutoModel.from_pretrained(self.config.framework.vj2_model.base_encoder)
+        self.vj_encoder.requires_grad_(False)
+        self.vj_encoder.eval()
         self.vj_processor = AutoVideoProcessor.from_pretrained(self.config.framework.vj2_model.base_encoder)
 
         self.vj_predictor = VisionTransformerPredictorAC(
@@ -131,6 +138,7 @@ class VLA_JEPA(baseframework):
             embed_dim=self.vj_encoder.config.hidden_size * 2, # multi view
             action_embed_dim=self.qwen_vl_interface.model.config.hidden_size,
             num_add_tokens=self.config.framework.vj2_model.num_action_tokens_per_timestep,
+            use_activation_checkpointing=self.enable_gradient_checkpointing,
         )
         self.future_projector = None
         if self.use_future_tokens:
@@ -181,6 +189,12 @@ class VLA_JEPA(baseframework):
             f"embodied_chars={len(self.embodied_replace_prompt)}, "
             f"num_action_token_ids={len(self.action_token_ids)}"
         )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if hasattr(self, "vj_encoder"):
+            self.vj_encoder.eval()
+        return self
 
     def _compute_dct_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         B, T, D = pred.shape
@@ -383,6 +397,7 @@ class VLA_JEPA(baseframework):
         if is_collated_batch:
             batch_images = examples["image"]
             batch_videos = examples["video"]
+            video_shape = examples.get("video_shape", None)
             instructions = examples["lang"]
             actions = examples.get("action", None)
             state = examples.get("state", None)
@@ -398,6 +413,7 @@ class VLA_JEPA(baseframework):
             vj_pixel_values_videos = None
             qwen_inputs = None
             vla_batch_size = None
+            video_shape = None
         is_mixed_cotrain_batch = vla_batch_size is not None
 
         """
@@ -430,12 +446,20 @@ class VLA_JEPA(baseframework):
 
         #[print(each.shape, end=";") for each in batch_videos]
         def stack_videos():
+            if batch_videos is None:
+                if video_shape is None:
+                    raise RuntimeError("Missing raw video and video_shape for VLA_JEPA forward.")
+                return None
             if torch.is_tensor(batch_videos):
                 return batch_videos.permute(0, 1, 2, 5, 3, 4).contiguous()
             stacked = np.stack(batch_videos)  #  [B, V, T, H, W, 3]
             return stacked.transpose(0,1,2,5,3,4)  # [B, V, T, 3, H, W]
 
         batch_videos = timed("forward/video_numpy_stack_time", stack_videos)
+        if batch_videos is not None:
+            video_shape = tuple(batch_videos.shape)
+        else:
+            video_shape = tuple(int(x) for x in video_shape)
 
         # Step 1: QWenVL input format
         def build_qwen_inputs():
@@ -600,8 +624,9 @@ class VLA_JEPA(baseframework):
             #exit()
         
             # Step 2: JEPA Encoder
-            B, V, T, C, H, W = batch_videos.shape
-            batch_videos = batch_videos.reshape(B*V, T, C, H, W)  # [B*V, T, C, H, W]
+            B, V, T, C, H, W = video_shape
+            if batch_videos is not None:
+                batch_videos = batch_videos.reshape(B*V, T, C, H, W)  # [B*V, T, C, H, W]
 
             def prepare_vj_videos():
                 expected_videos = B * V
@@ -614,6 +639,10 @@ class VLA_JEPA(baseframework):
                     ready_count = sum(item.shape[0] for item in ready_videos)
                     if ready_count == expected_videos:
                         return torch.cat(ready_videos, dim=0)
+                    if batch_videos is None:
+                        raise RuntimeError(
+                            "Raw videos are required when only part of vj_pixel_values_videos is preprocessed."
+                        )
                     input_videos = ready_videos
                     for i in range(ready_count, expected_videos):
                         input_videos.append(self.vj_processor(
@@ -623,6 +652,10 @@ class VLA_JEPA(baseframework):
                 if vj_pixel_values_videos is not None and vj_pixel_values_videos.shape[0] == expected_videos:
                     return vj_pixel_values_videos.to(self.vj_encoder.device, non_blocking=True)
                 if vj_pixel_values_videos is not None and is_mixed_cotrain_batch:
+                    if batch_videos is None:
+                        raise RuntimeError(
+                            "Raw videos are required when mixed cotrain VJ inputs are only partially preprocessed."
+                        )
                     vla_vj = vj_pixel_values_videos.to(self.vj_encoder.device, non_blocking=True)
                     input_videos = [vla_vj]
                     for i in range(vla_vj.shape[0], expected_videos):
@@ -630,6 +663,8 @@ class VLA_JEPA(baseframework):
                             videos=batch_videos[i], return_tensors="pt"
                         )["pixel_values_videos"].to(self.vj_encoder.device))
                     return torch.cat(input_videos, dim=0)
+                if batch_videos is None:
+                    raise RuntimeError("Raw videos are required when vj_pixel_values_videos is not provided.")
                 input_videos = []
                 for i in range(B*V):
                     input_videos.append(self.vj_processor(
@@ -643,7 +678,19 @@ class VLA_JEPA(baseframework):
                     "forward/vj_encoder_time",
                     lambda: self.vj_encoder.get_vision_features(pixel_values_videos=input_videos),
                 )
-                video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=V, dim=0), dim=2)
+                encoded_videos, num_video_tokens, video_embed_dim = video_embeddings.shape
+                expected_videos = B * V
+                if encoded_videos != expected_videos:
+                    raise RuntimeError(
+                        f"Expected V-JEPA encoder to return {expected_videos} videos "
+                        f"({B} batch * {V} views), got {encoded_videos}."
+                    )
+                # VJ inputs are flattened sample-major: [b0v0, b0v1, b1v0, b1v1, ...].
+                video_embeddings = (
+                    video_embeddings.reshape(B, V, num_video_tokens, video_embed_dim)
+                    .transpose(1, 2)
+                    .reshape(B, num_video_tokens, V * video_embed_dim)
+                )
             #print(video_embeddings.shape) # [B, T//tubelet_size * dim_per_frame, V*embed_dim]
         
             # Step 3: VJ Predictor

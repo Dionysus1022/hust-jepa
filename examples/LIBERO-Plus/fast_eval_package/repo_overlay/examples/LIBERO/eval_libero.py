@@ -20,10 +20,16 @@ from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from examples.LIBERO.model2libero_interface import M1Inference
+from starVLA.libero_proprio import (
+    libero_gripper_qpos_to_state,
+    libero_zero_pad_normalized_proprio,
+    normalize_libero_eef_proprio,
+)
 
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+PROPRIO_HISTORY_LEN = 8
 VANILLA_LIBERO_TASK_COUNTS = {
     "libero_spatial": 10,
     "libero_object": 10,
@@ -38,6 +44,31 @@ def _binarize_gripper_open(open_val: np.ndarray | float) -> np.ndarray:
     v = float(arr[0])
     bin_val = 1.0 - 2.0 * (v > 0.5)
     return np.asarray([bin_val], dtype=np.float32)
+
+
+def _libero_gripper_state(gripper_qpos: np.ndarray) -> np.ndarray:
+    return libero_gripper_qpos_to_state(gripper_qpos).reshape(1).astype(np.float32)
+
+
+def _libero_proprio_state(obs: dict) -> np.ndarray:
+    proprio = np.concatenate(
+        (
+            obs["robot0_eef_pos"],
+            _quat2axisangle(obs["robot0_eef_quat"]),
+            _libero_gripper_state(obs["robot0_gripper_qpos"]),
+        )
+    ).astype(np.float32)
+    return normalize_libero_eef_proprio(proprio)
+
+
+def _proprio_history_array(state_history: collections.deque) -> np.ndarray:
+    states = list(state_history)
+    pad_state = libero_zero_pad_normalized_proprio()
+    if not states:
+        return np.repeat(pad_state[None], PROPRIO_HISTORY_LEN, axis=0).astype(np.float32)
+    if len(states) < PROPRIO_HISTORY_LEN:
+        states = [pad_state] * (PROPRIO_HISTORY_LEN - len(states)) + states
+    return np.stack(states[-PROPRIO_HISTORY_LEN:], axis=0).astype(np.float32)
 
 import hashlib
 
@@ -161,6 +192,7 @@ def eval_libero(args: Args) -> None:
             t = 0
             replay_images = []
             full_actions = []
+            state_history = collections.deque(maxlen=PROPRIO_HISTORY_LEN)
 
             logging.info(f"Starting episode {task_episodes + 1}...")
             step = 0
@@ -185,13 +217,8 @@ def eval_libero(args: Args) -> None:
                 # Save preprocessed image for replay video
                 replay_images.append(img)
 
-                state = np.concatenate(
-                    (
-                        obs["robot0_eef_pos"],
-                        _quat2axisangle(obs["robot0_eef_quat"]),
-                        obs["robot0_gripper_qpos"],
-                    )
-                )
+                state_history.append(_libero_proprio_state(obs))
+                state = _proprio_history_array(state_history)
 
                 observation = { # 
                     "observation.primary": np.expand_dims(
@@ -200,7 +227,7 @@ def eval_libero(args: Args) -> None:
                     "observation.wrist_image": np.expand_dims(
                         wrist_img, axis=0
                     ),  # (H, W, C)
-                    "observation.state": np.expand_dims(state, axis=0),
+                    "observation.state": state,
                     "instruction": [str(task_description)],
                 }
 

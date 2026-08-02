@@ -202,15 +202,10 @@ class VLATrainer(TrainerUtils):
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
         set_seed(seed)
 
-        # load pretrained weights
-        if hasattr(self.config.trainer, "pretrained_checkpoint") and self.config.trainer.pretrained_checkpoint:
-            pretrained_checkpoint = self.config.trainer.pretrained_checkpoint
-            reload_modules = (
-                self.config.trainer.reload_modules if hasattr(self.config.trainer, "reload_modules") else None
-            )
-            ignore_mismatched_sizes = bool(
-                getattr(self.config.trainer, "ignore_mismatched_pretrained", False)
-            )
+        pretrained_checkpoint = self.config.trainer.get("pretrained_checkpoint", None)
+        if pretrained_checkpoint:
+            reload_modules = self.config.trainer.get("reload_modules", None)
+            ignore_mismatched_sizes = bool(self.config.trainer.get("ignore_mismatched_pretrained", False))
             self.model = self.load_pretrained_backbones(
                 self.model,
                 pretrained_checkpoint,
@@ -218,16 +213,8 @@ class VLATrainer(TrainerUtils):
                 ignore_mismatched_sizes=ignore_mismatched_sizes,
             )
 
-        # freeze parameters
-        freeze_modules = (
-            self.config.trainer.freeze_modules
-            if (self.config and hasattr(self.config.trainer, "freeze_modules"))
-            else None
-        )
-        self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
-
-        #  print model trainable parameters:
-        self.print_trainable_parameters(self.model)
+        if not self.config.trainer.get("_model_frozen_before_optimizer", False):
+            self.model = self.freeze_model_for_optimizer(self.model, self.config)
 
         # initialize distributed training components
         self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
@@ -457,6 +444,8 @@ class VLATrainer(TrainerUtils):
                             "bwd": f"{step_metrics.get('timing/backward_grad_sync_time', 0.0):.3f}",
                             "ds_step": f"{step_metrics.get('timing/deepspeed_step_time', 0.0):.3f}",
                             "h2d": f"{t_end_data - t_start_h2d:.3f}",
+                            "qwen_in": f"{step_metrics.get('forward/qwen_build_inputs_h2d_time', 0.0):.3f}",
+                            "vj_prep": f"{step_metrics.get('forward/vj_processor_h2d_time', 0.0):.3f}",
                         }
                     )
                 progress_bar.set_postfix(postfix)
@@ -622,6 +611,7 @@ def main(cfg, accelerator) -> None:
     output_dir = setup_directories(cfg=cfg)
     # build model
     vla = build_framework(cfg)
+    vla = TrainerUtils.freeze_model_for_optimizer(vla, cfg)
     # prepare data
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
 

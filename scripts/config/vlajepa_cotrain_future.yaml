@@ -1,4 +1,4 @@
-run_id: cotrain_future
+run_id: cotrain_future_QWen3.5_2B
 run_root_dir: checkpoints
 seed: 42
 trackers: [json]
@@ -9,17 +9,17 @@ is_debug: false
 framework:
   name: VLA_JEPA
   qwenvl:
-    base_vlm: /data/WangBizi/VLA_JEPA_models/Qwen3.5-0.8B
+    base_vlm: /data/WangBizi/VLA_JEPA_models/Qwen3.5-2B
     attn_implementation: flash_attention_2
-    vl_hidden_dim: 1024
+    vl_hidden_dim: 2048
   action_model:
     action_model_type: DiT-B
     action_hidden_dim: 1024     # TODO merge with hidden_size, in config v2
-    hidden_size: 1024     
+    hidden_size: 1024
     add_pos_embed: True
     max_seq_len: 1024
     action_dim: 7
-    state_dim: 8
+    state_dim: 7
     future_action_window_size: 6
     action_horizon: 7 # need merge with future_action_window_size 
     past_action_window_size: 0
@@ -31,7 +31,7 @@ framework:
     num_inference_timesteps: 4
     num_target_vision_tokens: 32
     diffusion_model_cfg:    
-      cross_attention_dim: 1024
+      cross_attention_dim: 2048
       dropout: 0.2
       final_dropout: true
       interleave_self_attention: true
@@ -44,12 +44,22 @@ framework:
     depth: 12
     num_heads: 8
     special_action_token: "<|action_{}|>"
-    num_action_tokens_per_timestep: 8
+    num_action_tokens_per_timestep: 3
     embodied_action_token: "<|embodied_action|>"
     num_embodied_action_tokens_per_instruction: 32
     enable_future_tokens: true
     special_future_token: "<|future_{}|>"
     num_frames: 8
+  vlanext_conditioning:
+    use_proprio_input_vlm: true
+    use_soft_connector: true
+    connector_depth: 2
+    connector_num_heads: 4
+    connector_mlp_ratio: 4.0
+    dct_loss_weight: 0.1
+    dct_freq_split: 0.125
+    dct_low_freq_weight: 5.0
+    dct_high_freq_weight: 0.0
   reduce_in_full_precision: true
 
 
@@ -62,11 +72,15 @@ datasets:
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
     resolution_size: 224   # image input of VLA will be resized and video will not, video will be precessed by world model videoprocessor
     video_resolution_size: 256
-    per_device_batch_size: 8
+    per_device_batch_size: 24
     preprocess_vj_inputs_in_collate: true
     preprocess_qwen_inputs_in_collate: true
+    num_workers: 12
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
     load_all_data_for_training: true
-    with_state: false
+    with_state: true
   video_data:
     dataset_py: video_datasets
     video_dir: /home/WangBizi/datasets/ssv/videos_extracted/20bn-something-something-v2
@@ -78,15 +92,20 @@ datasets:
     per_device_batch_size: 8
     preprocess_vj_inputs_in_collate: true
     preprocess_qwen_inputs_in_collate: true
+    num_workers: 8
+    decode_threads: 1
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
 
 
 trainer:
   epochs: 100
-  max_train_steps: 12500
-  num_warmup_steps: 1250
+  max_train_steps: 40000
+  num_warmup_steps: 4000
   #num_warmup_steps: 0
-  save_interval: 1250
-  eval_interval: 1250
+  save_interval: 2500
+  eval_interval: 5000
   learning_rate:
     base: 3.0e-05
     qwen_vl_interface: 1.0e-05
@@ -102,10 +121,11 @@ trainer:
   max_grad_norm: 1.0
   warmup_ratio: 0.1
   weight_decay: 0.0
-  logging_frequency: 10
+  logging_frequency: 1
   gradient_clipping: 1.0
-  gradient_accumulation_steps: 8
-  pretrained_checkpoint: /home/WangBizi/VLA-JEPA/checkpoints/cotrain_future/checkpoints/steps_5000_pytorch_model.pt
+  gradient_accumulation_steps: 2
+  dataloader_warmup_steps: 4
+  pretrained_checkpoint: null
   ignore_mismatched_pretrained: true
   
 
@@ -121,4 +141,4 @@ trainer:
   resume_step: null
   enable_gradient_checkpointing: true
   enable_mixed_precision_training: true
-  enable_detailed_timing: false
+  enable_detailed_timing: true
