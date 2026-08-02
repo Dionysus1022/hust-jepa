@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -487,6 +488,7 @@ class Libero4in1DataConfig:
 
     def __init__(self, observation_indices, action_indices):
         self.observation_indices = observation_indices
+        self.state_observation_indices = list(range(1 - len(observation_indices), 1))
         self.action_indices = action_indices
 
     def modality_config(self):
@@ -495,7 +497,7 @@ class Libero4in1DataConfig:
             modality_keys=self.video_keys,
         )
         state_modality = ModalityConfig(
-            delta_indices=self.observation_indices,
+            delta_indices=self.state_observation_indices,
             modality_keys=self.state_keys,
         )
         action_modality = ModalityConfig(

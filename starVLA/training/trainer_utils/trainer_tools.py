@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 metrics.py
 
@@ -10,6 +11,7 @@ import re
 import json
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from accelerate.logging import get_logger
 
@@ -92,7 +94,7 @@ def build_param_lr_groups(model, cfg):
             for attr in module_name.split("."):
                 module = getattr(module, attr)
             # filter out frozen parameters
-            params = [p for p in module.parameters() if id(p) not in frozen_params]
+            params = [p for p in module.parameters() if p.requires_grad and id(p) not in frozen_params]
             if params:  # only add param group if there are trainable parameters
                 param_groups.append({"params": params, "lr": lr, "name": module_name})
                 used_params.update(id(p) for p in params)
@@ -100,15 +102,20 @@ def build_param_lr_groups(model, cfg):
             ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
 
     # assign base learning rate to the remaining unused parameters (exclude frozen ones)
-    other_params = [p for p in model.parameters() if id(p) not in used_params and id(p) not in frozen_params]
+    other_params = [
+        p for p in model.parameters()
+        if p.requires_grad and id(p) not in used_params and id(p) not in frozen_params
+    ]
     if other_params:
         param_groups.append({"params": other_params, "lr": base_lr, "name": "base"})
 
     return param_groups
 
 
-import torch.distributed as dist
-
+def _distributed_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
 
 def only_main_process(func):
     """
@@ -142,10 +149,6 @@ def resize_images(images, target_size=(224, 224)):
     else:
         raise ValueError("Unsupported image type or structure.")
 
-
-import torch.distributed as dist
-
-
 class TrainerUtils:
     @staticmethod
     def freeze_backbones(model, freeze_modules=""):
@@ -165,8 +168,9 @@ class TrainerUtils:
           - model:
         """
         frozen = []
-        print("#"*30)
-        print(freeze_modules)
+        if _distributed_rank() == 0:
+            print("#"*30)
+            print(freeze_modules)
         if freeze_modules and type(freeze_modules) == str:
             # split and remove whitespace
             patterns = [p.strip() for p in freeze_modules.split(",") if p.strip()] if freeze_modules else []
@@ -187,8 +191,9 @@ class TrainerUtils:
                     print(f"⚠️ module path does not exist, cannot freeze: {path}")
                     continue
 
-        dist.barrier()  # synchronize when distributed training
-        if dist.get_rank == 0:
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()  # synchronize when distributed training
+        if _distributed_rank() == 0:
             print(f"🔒 Frozen modules with re pattern: {frozen}")
         return model
 
@@ -198,7 +203,7 @@ class TrainerUtils:
         print the total number of parameters and trainable parameters of the model
         :param model: PyTorch model instance
         """
-        if dist.get_rank() != 0:
+        if _distributed_rank() != 0:
             return
         print("📊 model parameter statistics:")
         num_params = sum(p.numel() for p in model.parameters())
@@ -209,7 +214,50 @@ class TrainerUtils:
         return num_params, num_trainable_params
 
     @staticmethod
-    def load_pretrained_backbones(model, checkpoint_path=None, reload_modules=None):
+    def freeze_model_for_optimizer(model, cfg):
+        """Apply configured freezes before optimizer groups are built."""
+        trainer_cfg = cfg.trainer if hasattr(cfg, "trainer") else {}
+        freeze_modules = trainer_cfg.get("freeze_modules", None)
+        model = TrainerUtils.freeze_backbones(model, freeze_modules=freeze_modules)
+        TrainerUtils.print_trainable_parameters(model)
+        if hasattr(cfg, "trainer"):
+            cfg.trainer._model_frozen_before_optimizer = True
+        return model
+
+    @staticmethod
+    def _filter_compatible_state_dict(module, state_dict):
+        module_state = module.state_dict()
+        compatible_state = {}
+        skipped_missing = []
+        skipped_mismatch = []
+
+        for key, value in state_dict.items():
+            if key not in module_state:
+                skipped_missing.append(key)
+            elif module_state[key].shape != value.shape:
+                skipped_mismatch.append((key, tuple(value.shape), tuple(module_state[key].shape)))
+            else:
+                compatible_state[key] = value
+
+        return compatible_state, skipped_missing, skipped_mismatch
+
+    @staticmethod
+    def _print_load_summary(loaded_state, skipped_missing, skipped_mismatch, module_name):
+        if _distributed_rank() != 0:
+            return
+
+        print(f"✅ loaded {len(loaded_state)} compatible tensors to '{module_name}'")
+        if skipped_missing:
+            print(f"⚠️ skipped {len(skipped_missing)} checkpoint tensors not present in '{module_name}'")
+        if skipped_mismatch:
+            print(f"⚠️ skipped {len(skipped_mismatch)} tensors with shape mismatch in '{module_name}'")
+            for key, ckpt_shape, model_shape in skipped_mismatch[:20]:
+                print(f"   - {key}: checkpoint {ckpt_shape} vs model {model_shape}")
+            if len(skipped_mismatch) > 20:
+                print(f"   ... and {len(skipped_mismatch) - 20} more")
+
+    @staticmethod
+    def load_pretrained_backbones(model, checkpoint_path=None, reload_modules=None, ignore_mismatched_sizes=False):
         """
         load checkpoint:
         - if reload_modules is set, load by path part
@@ -220,7 +268,7 @@ class TrainerUtils:
         """
         if not checkpoint_path:
             return []
-        if dist.get_rank() == 0:
+        if _distributed_rank() == 0:
             print(f"📦 loading checkpoint: {checkpoint_path}")
         try:
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -240,9 +288,18 @@ class TrainerUtils:
                     prefix = path + "."
                     sub_state_dict = {k[len(prefix) :]: v for k, v in checkpoint.items() if k.startswith(prefix)}
                     if sub_state_dict:
-                        module.load_state_dict(sub_state_dict, strict=True)
-                        if dist.get_rank() == 0:
-                            print(f"✅ parameters loaded to module '{path}'")
+                        if ignore_mismatched_sizes:
+                            compatible_state, skipped_missing, skipped_mismatch = TrainerUtils._filter_compatible_state_dict(
+                                module, sub_state_dict
+                            )
+                            module.load_state_dict(compatible_state, strict=False)
+                            TrainerUtils._print_load_summary(
+                                compatible_state, skipped_missing, skipped_mismatch, path
+                            )
+                        else:
+                            module.load_state_dict(sub_state_dict, strict=True)
+                            if _distributed_rank() == 0:
+                                print(f"✅ parameters loaded to module '{path}'")
                         loaded_modules.append(path)
                     else:
                         print(f"⚠️ parameters not found in checkpoint '{path}'")
@@ -250,9 +307,18 @@ class TrainerUtils:
                     print(f"❌ cannot find module path: {path}")
         else:  # full load
             try:
-                model.load_state_dict(checkpoint, strict=True)
-                if dist.get_rank() == 0:
-                    print("✅ loaded <full_model> model parameters")
+                if ignore_mismatched_sizes:
+                    compatible_state, skipped_missing, skipped_mismatch = TrainerUtils._filter_compatible_state_dict(
+                        model, checkpoint
+                    )
+                    model.load_state_dict(compatible_state, strict=False)
+                    TrainerUtils._print_load_summary(
+                        compatible_state, skipped_missing, skipped_mismatch, "<full_model>"
+                    )
+                else:
+                    model.load_state_dict(checkpoint, strict=True)
+                    if _distributed_rank() == 0:
+                        print("✅ loaded <full_model> model parameters")
                 loaded_modules = ["<full_model>"]
             except Exception as e:
                 raise RuntimeError(f"❌ loading full model failed: {e}")

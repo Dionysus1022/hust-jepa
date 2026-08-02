@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Modified from facebookresearch's DiT repos
 # DiT: https://github.com/facebookresearch/DiT/blob/main/models.py
 

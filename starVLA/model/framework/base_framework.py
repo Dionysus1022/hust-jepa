@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Base framework abstraction providing:
 - Pretrained loading (config + normalization stats + weights)

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Shared configuration / utility helpers for framework components:
 - NamespaceWithGet: lightweight namespace behaving like a dict

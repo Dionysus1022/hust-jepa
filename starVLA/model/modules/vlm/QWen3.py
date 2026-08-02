@@ -1,11 +1,15 @@
+from __future__ import annotations
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License, Version 1.0 (the "License"); 
 # Implemented by [Jinhui YE / HKUST University] in [2025].
 
 import torch
+import json
+import logging
+from pathlib import Path
 from typing import Optional, List
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from typing import Dict, Optional, List
 from torch.nn.utils.rnn import pad_sequence
@@ -17,6 +21,7 @@ from qwen_vl_utils import process_vision_info
 from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
+py_logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
@@ -30,6 +35,62 @@ _ACTION_TOKEN_MAX = 153984 # here only for fast_tokenizer, see starVLA/model/mod
 
 
 import torch.nn as nn
+
+
+def _read_local_hf_config_name(model_id: str) -> str:
+    config_path = Path(model_id).expanduser() / "config.json"
+    if not config_path.is_file():
+        return ""
+
+    try:
+        with config_path.open("r") as f:
+            hf_config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+    names = []
+    for key in ("model_type", "architectures"):
+        value = hf_config.get(key)
+        if isinstance(value, str):
+            names.append(value)
+        elif isinstance(value, list):
+            names.extend(str(item) for item in value)
+    return " ".join(names)
+
+
+def _get_qwen3_model_class(model_id: str):
+    model_name = f"{model_id} {_read_local_hf_config_name(model_id)}".lower()
+    compact_name = model_name.replace("_", "").replace("-", "").replace(".", "")
+
+    if "qwen35" in compact_name:
+        try:
+            from transformers import Qwen3_5ForConditionalGeneration
+        except ImportError as exc:
+            raise RuntimeError(
+                "base_vlm is Qwen3.5, but the current transformers package does not support "
+                "`Qwen3_5ForConditionalGeneration`. Upgrade transformers in the VLA_JEPA "
+                "environment, for example: "
+                "`/home/WangBizi/miniconda3/envs/VLA_JEPA/bin/pip install -U transformers`."
+            ) from exc
+        return Qwen3_5ForConditionalGeneration
+    return Qwen3VLForConditionalGeneration
+
+
+def _resolve_attn_implementation(model_cls, requested: str) -> str:
+    supports_flash_attn = getattr(model_cls, "_supports_flash_attn", False) or getattr(
+        model_cls, "_supports_flash_attn_2", False
+    )
+    if requested == "flash_attention_2" and not supports_flash_attn:
+        fallback = "sdpa" if getattr(model_cls, "_supports_sdpa", False) else "eager"
+        py_logger.warning(
+            "%s does not advertise FlashAttention-2 support in this transformers build; "
+            "using attn_implementation=%s instead of %s.",
+            model_cls.__name__,
+            fallback,
+            requested,
+        )
+        return fallback
+    return requested
 
 
 class _QWen3_VL_Interface(nn.Module):
@@ -55,14 +116,35 @@ class _QWen3_VL_Interface(nn.Module):
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3-VL-4B-Instruct")
 
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
+        model_cls = _get_qwen3_model_class(model_id)
+        attn_implementation = _resolve_attn_implementation(
+            model_cls,
+            qwenvl_config.get("attn_implementation", "flash_attention_2"),
+        )
+        logger.info(
+            f"Loading Qwen VLM from {model_id} with class {model_cls.__name__} "
+            f"and attn_implementation={attn_implementation}"
+        )
+        model = model_cls.from_pretrained(
             model_id,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             dtype=torch.bfloat16,
             device_map="cuda",
         )
+        logger.info(f"Loaded Qwen VLM with resolved attn_implementation={model.config._attn_implementation}")
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
+
+        model.config.use_cache = False
+        if hasattr(model.config, "text_config"):
+            model.config.text_config.use_cache = False
+        trainer_cfg = config.trainer if hasattr(config, "trainer") else {}
+        if trainer_cfg.get("enable_gradient_checkpointing", False) and hasattr(model, "gradient_checkpointing_enable"):
+            try:
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                model.gradient_checkpointing_enable()
+            logger.info("Enabled gradient checkpointing for Qwen VLM")
 
         self.model = model
         self.processor = processor
@@ -80,9 +162,14 @@ class _QWen3_VL_Interface(nn.Module):
         """
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            outputs = self.model(
-                **kwargs,
-            )
+            labels = kwargs.get("labels", None)
+            skip_lm_head = self.config.trainer.get("skip_qwen_lm_head", True)
+            if skip_lm_head and labels is None:
+                outputs = self.model.model(**kwargs)
+            else:
+                outputs = self.model(
+                    **kwargs,
+                )
 
         return outputs
 
@@ -104,7 +191,16 @@ class _QWen3_VL_Interface(nn.Module):
             )
         return generation_output
 
-    def build_qwenvl_inputs(self, images, instructions, solutions=None, prompt_replace_dict=None, prompt_template=None, **kwargs):
+    def build_qwenvl_inputs(
+        self,
+        images,
+        instructions,
+        solutions=None,
+        prompt_replace_dict=None,
+        prompt_template=None,
+        device="model",
+        **kwargs,
+    ):
         """
         Build model inputs from raw data (images + instructions + optional solutions).
         Follow Oficial Qwen3-VL Instruct format: https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct
@@ -179,7 +275,11 @@ class _QWen3_VL_Interface(nn.Module):
             labels[labels == self.processor.tokenizer.pad_token_id] = -100 ## mask out pad tokens as well
             batch_inputs['labels'] = labels
 
-        return batch_inputs.to(self.model.device)
+        if device == "model":
+            device = self.model.device
+        if device is not None:
+            return batch_inputs.to(device)
+        return batch_inputs
 
 
 

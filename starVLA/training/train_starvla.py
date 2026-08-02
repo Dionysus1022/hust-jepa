@@ -1,3 +1,4 @@
+from __future__ import annotations
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License, Version 1.0 (the "License"); 
 # Implemented by [Jinhui YE / HKUST University] in [2025].
@@ -33,7 +34,7 @@ import wandb
 import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import GradientAccumulationPlugin, set_seed
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import AutoProcessor, get_scheduler
@@ -44,11 +45,21 @@ from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(
-    deepspeed_plugin=deepspeed_plugin,
-)
-accelerator.print(accelerator.state)
+
+def create_accelerator(cfg) -> Accelerator:
+    grad_accum_steps = int(getattr(cfg.trainer, "gradient_accumulation_steps", 1))
+    grad_accum_plugin = GradientAccumulationPlugin(
+        num_steps=grad_accum_steps,
+        sync_each_batch=False,
+    )
+    deepspeed_plugin = DeepSpeedPlugin()
+    accelerator = Accelerator(
+        deepspeed_plugin=deepspeed_plugin,
+        gradient_accumulation_plugin=grad_accum_plugin,
+    )
+    accelerator.print(accelerator.state)
+    accelerator.print(f"Using gradient_accumulation_steps={accelerator.gradient_accumulation_steps}")
+    return accelerator
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -58,6 +69,21 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def configure_torch_runtime(cfg) -> None:
+    trainer_cfg = getattr(cfg, "trainer", {})
+    if trainer_cfg.get("enable_tf32", True):
+        torch.set_float32_matmul_precision(trainer_cfg.get("float32_matmul_precision", "high"))
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    if trainer_cfg.get("enable_fast_sdp", True) and torch.cuda.is_available():
+        cuda_backends = torch.backends.cuda
+        if hasattr(cuda_backends, "enable_flash_sdp"):
+            cuda_backends.enable_flash_sdp(True)
+        if hasattr(cuda_backends, "enable_mem_efficient_sdp"):
+            cuda_backends.enable_mem_efficient_sdp(True)
 
 
 def load_fast_tokenizer():
@@ -151,29 +177,44 @@ class VLATrainer(TrainerUtils):
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
 
+    def _move_batch_to_device(self, batch):
+        if torch.is_tensor(batch):
+            return batch.to(self.accelerator.device, non_blocking=True)
+        if batch.__class__.__name__ == "BatchFeature":
+            return batch.to(self.accelerator.device)
+        if isinstance(batch, dict):
+            has_preprocessed_vj = "vj_pixel_values_videos" in batch
+            has_preprocessed_qwen = "qwen_inputs" in batch
+            return {
+                k: v
+                if (has_preprocessed_vj and k == "video") or (has_preprocessed_qwen and k in {"image", "lang"})
+                else self._move_batch_to_device(v)
+                for k, v in batch.items()
+            }
+        if isinstance(batch, tuple):
+            return tuple(self._move_batch_to_device(v) for v in batch)
+        if isinstance(batch, list):
+            return [self._move_batch_to_device(v) for v in batch]
+        return batch
+
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
         set_seed(seed)
 
-        # load pretrained weights
-        if hasattr(self.config.trainer, "pretrained_checkpoint") and self.config.trainer.pretrained_checkpoint:
-            pretrained_checkpoint = self.config.trainer.pretrained_checkpoint
-            reload_modules = (
-                self.config.trainer.reload_modules if hasattr(self.config.trainer, "reload_modules") else None
+        pretrained_checkpoint = self.config.trainer.get("pretrained_checkpoint", None)
+        if pretrained_checkpoint:
+            reload_modules = self.config.trainer.get("reload_modules", None)
+            ignore_mismatched_sizes = bool(self.config.trainer.get("ignore_mismatched_pretrained", False))
+            self.model = self.load_pretrained_backbones(
+                self.model,
+                pretrained_checkpoint,
+                reload_modules=reload_modules,
+                ignore_mismatched_sizes=ignore_mismatched_sizes,
             )
-            self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
 
-        # freeze parameters
-        freeze_modules = (
-            self.config.trainer.freeze_modules
-            if (self.config and hasattr(self.config.trainer, "freeze_modules"))
-            else None
-        )
-        self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
-
-        #  print model trainable parameters:
-        self.print_trainable_parameters(self.model)
+        if not self.config.trainer.get("_model_frozen_before_optimizer", False):
+            self.model = self.freeze_model_for_optimizer(self.model, self.config)
 
         # initialize distributed training components
         self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
@@ -226,7 +267,7 @@ class VLATrainer(TrainerUtils):
     def _save_checkpoint(self):
         """save current training state"""
 
-        if accelerator.is_main_process:
+        if self.accelerator.is_main_process:
 
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
             # save model state
@@ -240,7 +281,7 @@ class VLATrainer(TrainerUtils):
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
             self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
-        accelerator.wait_for_everyone()
+        self.accelerator.wait_for_everyone()
 
     def _log_metrics(self, metrics):
         """record training metrics"""
@@ -346,13 +387,16 @@ class VLATrainer(TrainerUtils):
             range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
         )
 
-        i = 0
-
         # main training loop
         while self.completed_steps < self.config.trainer.max_train_steps:
             # get data batch
             t_start_data = time.perf_counter()
             batch_vla = self._get_next_batch()
+            t_end_fetch = time.perf_counter()
+            t_start_h2d = time.perf_counter()
+            batch_vla = self._move_batch_to_device(batch_vla)
+            if self.config.trainer.get("enable_detailed_timing", False) and torch.cuda.is_available():
+                torch.cuda.synchronize()
             t_end_data = time.perf_counter()
 
             # execute training step
@@ -360,8 +404,11 @@ class VLATrainer(TrainerUtils):
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
 
+            is_update_step = step_metrics.pop("is_update_step", True)
+
             # update progress
-            if self.accelerator.sync_gradients:
+            if is_update_step:
+                self.lr_scheduler.step()
                 progress_bar.update(1)
                 self.completed_steps += 1
             
@@ -386,25 +433,38 @@ class VLATrainer(TrainerUtils):
             """
             
             if self.accelerator.is_local_main_process:
-                progress_bar.set_postfix(
+                postfix = {
+                    "data_times": f"{t_end_data - t_start_data:.3f}",
+                    "model_times": f"{t_end_model - t_start_model:.3f}",
+                }
+                if self.config.trainer.get("enable_detailed_timing", False):
+                    postfix.update(
                         {
-                            "data_times": f"{t_end_data - t_start_data:.3f}",
-                            "model_times": f"{t_end_model - t_start_model:.3f}",
+                            "fwd": f"{step_metrics.get('timing/forward_total_time', 0.0):.3f}",
+                            "bwd": f"{step_metrics.get('timing/backward_grad_sync_time', 0.0):.3f}",
+                            "ds_step": f"{step_metrics.get('timing/deepspeed_step_time', 0.0):.3f}",
+                            "h2d": f"{t_end_data - t_start_h2d:.3f}",
+                            "qwen_in": f"{step_metrics.get('forward/qwen_build_inputs_h2d_time', 0.0):.3f}",
+                            "vj_prep": f"{step_metrics.get('forward/vj_processor_h2d_time', 0.0):.3f}",
                         }
                     )
+                progress_bar.set_postfix(postfix)
 
-            # evaluate model
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+            if is_update_step:
+                # evaluate model
+                if self.completed_steps % self.config.trainer.eval_interval == 0:
+                    step_metrics = self.eval_action_model(step_metrics)
 
-            # record metrics
-            step_metrics["data_time"] = t_end_data - t_start_data
-            step_metrics["model_time"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
+                # record metrics
+                step_metrics["data_time"] = t_end_data - t_start_data
+                step_metrics["data_fetch_time"] = t_end_fetch - t_start_data
+                step_metrics["batch_h2d_time"] = t_end_data - t_start_h2d
+                step_metrics["model_time"] = t_end_model - t_start_model
+                self._log_metrics(step_metrics)
 
-            # save checkpoint
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
-                self._save_checkpoint()
+                # save checkpoint
+                if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+                    self._save_checkpoint()
 
             # check termination condition
             if self.completed_steps >= self.config.trainer.max_train_steps:
@@ -431,10 +491,18 @@ class VLATrainer(TrainerUtils):
             score = 0.0
             num_samples = len(examples)
 
-            batch_images = [example["image"] for example in examples]
-            instructions = [example["lang"] for example in examples]  # [B, str]
-            actions = [example["action"] for example in examples]  # label
-            state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+            if isinstance(examples, dict):
+                batch_images = examples["image"]
+                instructions = examples["lang"]
+                actions = examples["action"].detach().cpu().numpy() if torch.is_tensor(examples["action"]) else examples["action"]
+                state = examples.get("state", None)
+                if torch.is_tensor(state):
+                    state = state.detach().cpu().numpy()
+            else:
+                batch_images = [example["image"] for example in examples]
+                instructions = [example["lang"] for example in examples]  # [B, str]
+                actions = [example["action"] for example in examples]  # label
+                state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
 
 
             # Predict actions using the model
@@ -475,26 +543,46 @@ class VLATrainer(TrainerUtils):
 
     def _train_step(self, batch_vla, batch_vlm=None):
         """execute single training step"""
-        with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
-            # VLA task forward propagation
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla)
+        detailed_timing = bool(self.config.trainer.get("enable_detailed_timing", False))
+        timing = {}
 
-                total_loss = sum(output_dict.values())
+        def sync_cuda():
+            if detailed_timing and torch.cuda.is_available():
+                torch.cuda.synchronize()
 
-            # VLA backward propagation
-            self.accelerator.backward(total_loss)
+        def timed(name, fn):
+            if not detailed_timing:
+                return fn()
+            sync_cuda()
+            start = time.perf_counter()
+            result = fn()
+            sync_cuda()
+            timing[name] = time.perf_counter() - start
+            return result
 
-            # gradient clipping
-            if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+        # VLA task forward propagation
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output_dict = timed("timing/forward_total_time", lambda: self.model.forward(batch_vla))
 
-            # optimizer step
-            self.optimizer.step()
-            self.lr_scheduler.step()
-            
-            result_dict = {k: v.item() for k, v in output_dict.items()}
+            total_loss = timed("timing/loss_sum_time", lambda: sum(output_dict.values()))
+
+        # DeepSpeed separates backward from its boundary-aware step. The
+        # backward timer includes autograd plus gradient communication.
+        is_update_step = True
+        if hasattr(self.model, "backward") and hasattr(self.model, "step"):
+            timed("timing/backward_grad_sync_time", lambda: self.model.backward(total_loss))
+            if hasattr(self.model, "is_gradient_accumulation_boundary"):
+                is_update_step = bool(self.model.is_gradient_accumulation_boundary())
+            timed("timing/deepspeed_step_time", self.model.step)
+        else:
+            timed("timing/backward_grad_sync_time", lambda: self.accelerator.backward(total_loss))
+
+        result_dict = {k: v.item() for k, v in output_dict.items()}
+        result_dict["is_update_step"] = is_update_step
+        if detailed_timing:
+            wrapped_model = getattr(self.model, "module", self.model)
+            result_dict.update(getattr(wrapped_model, "last_forward_timing", {}))
+            result_dict.update(timing)
 
         return result_dict
 
@@ -515,13 +603,15 @@ class VLATrainer(TrainerUtils):
         self.accelerator.wait_for_everyone()
 
 
-def main(cfg) -> None:
+def main(cfg, accelerator) -> None:
     logger.info("VLA Training :: Warming Up")
+    configure_torch_runtime(cfg)
 
     # create output directory and save config
     output_dir = setup_directories(cfg=cfg)
     # build model
     vla = build_framework(cfg)
+    vla = TrainerUtils.freeze_model_for_optimizer(vla, cfg)
     # prepare data
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
 
@@ -560,6 +650,7 @@ if __name__ == "__main__":
     dotlist = normalize_dotlist_args(clipargs)  # Normalize CLI args to dotlist format
     cli_cfg = OmegaConf.from_dotlist(dotlist)
     cfg = OmegaConf.merge(cfg, cli_cfg)
+    accelerator = create_accelerator(cfg)
 
     # if cfg.is_debug:
     if cfg.is_debug and dist.is_initialized() and dist.get_rank() == 0:
@@ -568,4 +659,4 @@ if __name__ == "__main__":
         print("🔍 Rank 0 waiting for debugger attach on port 10092...")
         debugpy.wait_for_client()
 
-    main(cfg)
+    main(cfg, accelerator)

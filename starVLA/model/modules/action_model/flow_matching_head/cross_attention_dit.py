@@ -1,3 +1,4 @@
+from __future__ import annotations
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -17,6 +18,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from diffusers import ConfigMixin, ModelMixin
 from diffusers.configuration_utils import register_to_config
 from diffusers.models.attention import Attention, FeedForward
@@ -276,27 +278,63 @@ class DiT(ModelMixin, ConfigMixin):
         hidden_states = hidden_states.contiguous()
         encoder_hidden_states = encoder_hidden_states.contiguous()
 
-        all_hidden_states = [hidden_states]
+        all_hidden_states = [hidden_states] if return_all_hidden_states else None
 
         # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1 and self.config.interleave_self_attention:
-                hidden_states = block(
-                    hidden_states,
-                    attention_mask=None,
-                    encoder_hidden_states=None,
-                    encoder_attention_mask=None,
-                    temb=temb,
-                )
+                if self.training and self.gradient_checkpointing:
+                    def custom_forward(hidden_states, temb, block=block):
+                        return block(
+                            hidden_states,
+                            attention_mask=None,
+                            encoder_hidden_states=None,
+                            encoder_attention_mask=None,
+                            temb=temb,
+                        )
+
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        custom_forward,
+                        hidden_states,
+                        temb,
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden_states = block(
+                        hidden_states,
+                        attention_mask=None,
+                        encoder_hidden_states=None,
+                        encoder_attention_mask=None,
+                        temb=temb,
+                    )
             else:
-                hidden_states = block(
-                    hidden_states,
-                    attention_mask=None,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=None,
-                    temb=temb,
-                )
-            all_hidden_states.append(hidden_states)
+                if self.training and self.gradient_checkpointing:
+                    def custom_forward(hidden_states, encoder_hidden_states, temb, block=block):
+                        return block(
+                            hidden_states,
+                            attention_mask=None,
+                            encoder_hidden_states=encoder_hidden_states,
+                            encoder_attention_mask=None,
+                            temb=temb,
+                        )
+
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        custom_forward,
+                        hidden_states,
+                        encoder_hidden_states,
+                        temb,
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden_states = block(
+                        hidden_states,
+                        attention_mask=None,
+                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_attention_mask=None,
+                        temb=temb,
+                    )
+            if return_all_hidden_states:
+                all_hidden_states.append(hidden_states)
 
         # Output processing
         conditioning = temb
@@ -364,12 +402,20 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
     ):
         # Process through transformer blocks - single pass through the blocks
         hidden_states = hidden_states.contiguous()
-        all_hidden_states = [hidden_states]
+        all_hidden_states = [hidden_states] if return_all_hidden_states else None
 
         # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
-            hidden_states = block(hidden_states)
-            all_hidden_states.append(hidden_states)
+            if self.training and self.gradient_checkpointing:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    block,
+                    hidden_states,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states = block(hidden_states)
+            if return_all_hidden_states:
+                all_hidden_states.append(hidden_states)
 
         if return_all_hidden_states:
             return hidden_states, all_hidden_states

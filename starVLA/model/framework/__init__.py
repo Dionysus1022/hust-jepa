@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Framework factory utilities.
 Automatically builds registered framework implementations

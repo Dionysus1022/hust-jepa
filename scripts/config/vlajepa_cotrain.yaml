@@ -9,9 +9,9 @@ is_debug: false
 framework:
   name: VLA_JEPA
   qwenvl:
-    base_vlm: /home/dataset-local/models/Qwen3-VL-2B-Instruct
+    base_vlm: /data/WangBizi/VLA_JEPA_models/Qwen3.5-0.8B
     attn_implementation: flash_attention_2
-    vl_hidden_dim: 2048
+    vl_hidden_dim: 1024
   action_model:
     action_model_type: DiT-B
     action_hidden_dim: 1024     # TODO merge with hidden_size, in config v2
@@ -19,7 +19,7 @@ framework:
     add_pos_embed: True
     max_seq_len: 1024
     action_dim: 7
-    state_dim: 8
+    state_dim: 7
     future_action_window_size: 6
     action_horizon: 7 # need merge with future_action_window_size 
     past_action_window_size: 0
@@ -31,7 +31,7 @@ framework:
     num_inference_timesteps: 4
     num_target_vision_tokens: 32
     diffusion_model_cfg:    
-      cross_attention_dim: 2048
+      cross_attention_dim: 1024
       dropout: 0.2
       final_dropout: true
       interleave_self_attention: true
@@ -40,7 +40,7 @@ framework:
       output_dim: 1024
       positional_embeddings: null
   vj2_model:
-    base_encoder: "/home/dataset-local/models/vjepa2-vitl-fpc64-256"
+    base_encoder: "/data/WangBizi/VLA_JEPA_models/vjepa2-vitl-fpc64-256"
     depth: 12
     num_heads: 8
     special_action_token: "<|action_{}|>"
@@ -54,33 +54,45 @@ framework:
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    data_root_dir: /home/dataset-local/datasets/LeRobot/droid
+    data_root_dir: /home/WangBizi/datasets/droid
     data_mix: droid
     action_type: delta_qpos
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
     resolution_size: 224   # image input of VLA will be resized and video will not, video will be precessed by world model videoprocessor
     video_resolution_size: 256
-    per_device_batch_size: 16
+    per_device_batch_size: 8
+    preprocess_vj_inputs_in_collate: true
+    preprocess_qwen_inputs_in_collate: true
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
     load_all_data_for_training: true
     with_state: false
   video_data:
     dataset_py: video_datasets
-    video_dir: /home/dataset-local/datasets/ssv2/20bn-something-something-v2
-    text_file: /home/dataset-local/datasets/ssv2/test-answers.csv
+    video_dir: /home/WangBizi/datasets/ssv/videos_extracted/20bn-something-something-v2
+    text_file: /home/WangBizi/datasets/ssv/test-answers.csv
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics of future frames {actions}."
     extensions: [webm]
     resolution_size: 224
     video_resolution_size: 256
-    per_device_batch_size: 16
+    per_device_batch_size: 8
+    preprocess_vj_inputs_in_collate: true
+    preprocess_qwen_inputs_in_collate: true
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
 
 
 trainer:
   epochs: 100
-  max_train_steps: 50000
-  num_warmup_steps: 5000
+  max_train_steps: 12500
+  num_warmup_steps: 1250
   #num_warmup_steps: 0
-  save_interval: 10000
-  eval_interval: 100
+  save_interval: 1250
+  eval_interval: 1250
   learning_rate:
     base: 3.0e-05
     qwen_vl_interface: 1.0e-05
@@ -97,7 +109,9 @@ trainer:
   weight_decay: 0.0
   logging_frequency: 10
   gradient_clipping: 1.0
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 8
+  pretrained_checkpoint: /home/WangBizi/VLA-JEPA/checkpoints/cotrain/checkpoints/steps_2500_pytorch_model.pt
+  ignore_mismatched_pretrained: true
   
 
   optimizer:
@@ -112,3 +126,4 @@ trainer:
   resume_step: null
   enable_gradient_checkpointing: true
   enable_mixed_precision_training: true
+  enable_detailed_timing: false
