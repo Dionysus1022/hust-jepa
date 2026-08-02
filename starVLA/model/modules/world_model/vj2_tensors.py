@@ -1,4 +1,3 @@
-from __future__ import annotations
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
@@ -52,3 +51,76 @@ def repeat_interleave_batch(x, B, repeat):
     N = len(x) // B
     x = torch.cat([torch.cat([x[i * B : (i + 1) * B] for _ in range(repeat)], dim=0) for i in range(N)], dim=0)
     return x
+
+
+def split_video_into_tubelets(batch_videos, tubelet_size):
+    """Move each temporal tubelet into an independent batch element."""
+    if batch_videos.ndim != 6:
+        raise ValueError(
+            "Expected videos with shape [B, V, T, C, H, W], "
+            f"got {tuple(batch_videos.shape)}"
+        )
+    if tubelet_size <= 0:
+        raise ValueError(f"tubelet_size must be positive, got {tubelet_size}")
+
+    batch_size, num_views, num_frames, channels, height, width = batch_videos.shape
+    if num_frames % tubelet_size != 0:
+        raise ValueError(
+            f"Video frame count ({num_frames}) must be divisible by the encoder "
+            f"tubelet size ({tubelet_size})"
+        )
+
+    num_steps = num_frames // tubelet_size
+    tubelets = batch_videos.reshape(
+        batch_size,
+        num_views,
+        num_steps,
+        tubelet_size,
+        channels,
+        height,
+        width,
+    )
+    tubelets = tubelets.reshape(
+        batch_size * num_views * num_steps,
+        tubelet_size,
+        channels,
+        height,
+        width,
+    )
+    return tubelets, (batch_size, num_views, num_steps)
+
+
+def merge_multiview_tubelet_embeddings(
+    embeddings,
+    batch_size,
+    num_views,
+    num_steps,
+):
+    """Restore batch/time axes and concatenate views along the feature axis."""
+    if embeddings.ndim != 3:
+        raise ValueError(
+            "Expected embeddings with shape [B*V*S, P, D], "
+            f"got {tuple(embeddings.shape)}"
+        )
+
+    expected_batch = batch_size * num_views * num_steps
+    if embeddings.shape[0] != expected_batch:
+        raise ValueError(
+            f"Expected {expected_batch} encoded tubelets, got {embeddings.shape[0]}"
+        )
+
+    tokens_per_state, embed_dim = embeddings.shape[1:]
+    embeddings = embeddings.reshape(
+        batch_size,
+        num_views,
+        num_steps,
+        tokens_per_state,
+        embed_dim,
+    )
+    embeddings = embeddings.permute(0, 2, 3, 1, 4).contiguous()
+    embeddings = embeddings.reshape(
+        batch_size,
+        num_steps * tokens_per_state,
+        num_views * embed_dim,
+    )
+    return embeddings, tokens_per_state
