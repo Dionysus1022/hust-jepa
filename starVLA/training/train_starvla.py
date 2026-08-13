@@ -152,13 +152,27 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
             logger.info(f"LR Group {group['name']}: lr={group['lr']}, num_params={len(group['params'])}")
 
     # initialize learning rate scheduler
-    lr_scheduler = get_scheduler(
-        name=cfg.trainer.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=cfg.trainer.num_warmup_steps,
-        num_training_steps=cfg.trainer.max_train_steps,
-        scheduler_specific_kwargs=cfg.trainer.scheduler_specific_kwargs,  # minimum learning rate
-    )
+    scheduler_type = str(cfg.trainer.lr_scheduler_type).lower()
+    if scheduler_type == "multistep":
+        scheduler_kwargs = dict(cfg.trainer.get("scheduler_specific_kwargs", {}))
+        milestones = scheduler_kwargs.pop("milestones", None)
+        if milestones is None:
+            milestones = [cfg.trainer.get("num_steps_before_decay", 100000)]
+        gamma = scheduler_kwargs.pop("gamma", 0.1)
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer,
+            milestones=list(milestones),
+            gamma=float(gamma),
+            **scheduler_kwargs,
+        )
+    else:
+        lr_scheduler = get_scheduler(
+            name=cfg.trainer.lr_scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=cfg.trainer.num_warmup_steps,
+            num_training_steps=cfg.trainer.max_train_steps,
+            scheduler_specific_kwargs=cfg.trainer.scheduler_specific_kwargs,  # minimum learning rate
+        )
 
     return optimizer, lr_scheduler
 

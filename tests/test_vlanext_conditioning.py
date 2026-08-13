@@ -4,7 +4,11 @@ import numpy as np
 import torch
 from PIL import Image
 
-from starVLA.dataloader.lerobot_datasets import _augment_video_frames, collate_fn
+from starVLA.dataloader.lerobot_datasets import (
+    _augment_video_frames,
+    _select_augmented_image_indices,
+    collate_fn,
+)
 from starVLA.model.framework.VLA_JEPA import SoftQueryConnector
 
 
@@ -47,6 +51,41 @@ def test_lerobot_collate_augments_vla_images_but_keeps_vjepa_video_clean():
     assert torch.equal(batch["video"][0], torch.from_numpy(original_video))
     assert not np.array_equal(np.asarray(batch["image"][0][0]), original_image)
     assert batch["action"].shape == (1, 7, 7)
+
+
+def test_lerobot_camera_aug_policy_uses_quarter_buckets(monkeypatch):
+    augmentation = {
+        "enabled": True,
+        "camera_aug_policy": "third_wrist_quarters",
+        "third_camera_index": 0,
+        "wrist_camera_index": 1,
+    }
+
+    for bucket, expected_indices in enumerate([set(), {0}, {1}, {0, 1}]):
+        monkeypatch.setattr(np.random, "randint", lambda high, bucket=bucket: bucket)
+
+        assert _select_augmented_image_indices(augmentation, num_images=2) == expected_indices
+
+
+def test_lerobot_camera_aug_policy_augments_only_selected_camera(monkeypatch):
+    sample = _fake_sample()
+    original_video = sample["video"].copy()
+    original_images = [np.asarray(image).copy() for image in sample["image"]]
+    monkeypatch.setattr(np.random, "randint", lambda high: 2)
+    augmentation = {
+        "enabled": True,
+        "camera_aug_policy": "third_wrist_quarters",
+        "third_camera_index": 0,
+        "wrist_camera_index": 1,
+        "random_brightness": [0.5, 0.5],
+        "augment_order": ["random_brightness"],
+    }
+
+    batch = collate_fn([sample], augmentation=augmentation)
+
+    assert torch.equal(batch["video"][0], torch.from_numpy(original_video))
+    assert np.array_equal(np.asarray(batch["image"][0][0]), original_images[0])
+    assert not np.array_equal(np.asarray(batch["image"][0][1]), original_images[1])
 
 
 def test_lerobot_image_augmentation_supports_camera_robustness_ops():

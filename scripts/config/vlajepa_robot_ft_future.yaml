@@ -1,4 +1,4 @@
-run_id: robot_ft_future
+run_id: robot_ft_future_Qwen3.5_2B
 run_root_dir: checkpoints
 seed: 42
 trackers:
@@ -7,7 +7,7 @@ is_debug: false
 framework:
   name: VLA_JEPA
   qwenvl:
-    base_vlm: /data/WangBizi/VLA_JEPA_models/Qwen3-VL-2B-Instruct
+    base_vlm: /data/WangBizi/VLA_JEPA_models/Qwen3.5-2B
     attn_implementation: flash_attention_2
     vl_hidden_dim: 2048
   action_model:
@@ -70,7 +70,7 @@ datasets:
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
     #CoT_answer: bbox
     resolution_size: 224   # image input of VLA will be resized and video will not, video will be precessed by world model videoprocessor
-    per_device_batch_size: 24
+    per_device_batch_size: 16
     video_resolution_size: 256
     load_all_data_for_training: true
     with_state: true
@@ -82,6 +82,9 @@ datasets:
     prefetch_factor: 2
     augmentation:
       enabled: true
+      camera_aug_policy: third_wrist_quarters
+      third_camera_index: 0   # video.primary_image / third-person camera
+      wrist_camera_index: 1   # video.wrist_image
       random_resized_crop:
         scale: [0.8, 1.0]
         ratio: [0.9, 1.1]
@@ -118,7 +121,7 @@ trainer:
   skip_qwen_lm_head: true
 
   epochs: 100
-  max_train_steps: 20000
+  max_train_steps: 30000
   num_warmup_steps: 3500
   #num_warmup_steps: 0
   save_interval: 2500
@@ -141,7 +144,7 @@ trainer:
   logging_frequency: 10000
   gradient_clipping: 1.0
   gradient_accumulation_steps: 2
-  pretrained_checkpoint: /home/WangBizi/VLA-JEPA/checkpoints/cotrain_future/checkpoints/steps_37500_pytorch_model.pt
+  pretrained_checkpoint: /home/WangBizi/VLA-JEPA/checkpoints/cotrain_future_QWen3.5_2B/checkpoints/steps_30000_pytorch_model.pt
   ignore_mismatched_pretrained: true
 
   optimizer:

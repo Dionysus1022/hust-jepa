@@ -1,11 +1,9 @@
-run_id: cotrain_future_QWen3.5_2B
+run_id: robot_ft_future_plus_mix_Qwen3.5_2B
 run_root_dir: checkpoints
 seed: 42
-trackers: [json]
-#wandb_entity: your_wandb_entity
-#wandb_project: llavavla
+trackers:
+- json
 is_debug: false
-
 framework:
   name: VLA_JEPA
   qwenvl:
@@ -14,14 +12,14 @@ framework:
     vl_hidden_dim: 2048
   action_model:
     action_model_type: DiT-B
-    action_hidden_dim: 1024     # TODO merge with hidden_size, in config v2
+    action_hidden_dim: 1024
     hidden_size: 1024
-    add_pos_embed: True
+    add_pos_embed: true
     max_seq_len: 1024
     action_dim: 7
     state_dim: 7
     future_action_window_size: 6
-    action_horizon: 7 # need merge with future_action_window_size 
+    action_horizon: 7
     past_action_window_size: 0
     repeated_diffusion_steps: 8
     noise_beta_alpha: 1.5
@@ -30,25 +28,25 @@ framework:
     num_timestep_buckets: 1000
     num_inference_timesteps: 4
     num_target_vision_tokens: 32
-    diffusion_model_cfg:    
+    diffusion_model_cfg:
       cross_attention_dim: 2048
       dropout: 0.2
       final_dropout: true
       interleave_self_attention: true
-      norm_type: "ada_norm"
+      norm_type: ada_norm
       num_layers: 16
       output_dim: 1024
       positional_embeddings: null
   vj2_model:
-    base_encoder: "/data/WangBizi/VLA_JEPA_models/vjepa2-vitl-fpc64-256"
+    base_encoder: /data/WangBizi/VLA_JEPA_models/vjepa2-vitl-fpc64-256
     depth: 12
     num_heads: 8
-    special_action_token: "<|action_{}|>"
+    special_action_token: <|action_{}|>
     num_action_tokens_per_timestep: 3
-    embodied_action_token: "<|embodied_action|>"
+    embodied_action_token: <|embodied_action|>
     num_embodied_action_tokens_per_instruction: 32
     enable_future_tokens: true
-    special_future_token: "<|future_{}|>"
+    special_future_token: <|future_{}|>
     num_frames: 8
   vlanext_conditioning:
     use_proprio_input_vlm: true
@@ -66,68 +64,88 @@ framework:
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    data_root_dir: /home/WangBizi/datasets/droid
-    data_mix: droid
+    data_root_dir: /home/WangBizi/VLA-JEPA/dataset/LeRobot/LEROBOT_LIBERO_DATA
+    data_mix: libero_all_plus
     action_type: delta_qpos
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
-    resolution_size: 224   # image input of VLA will be resized and video will not, video will be precessed by world model videoprocessor
+    resolution_size: 224
+    per_device_batch_size: 8
     video_resolution_size: 256
-    per_device_batch_size: 24
-    preprocess_vj_inputs_in_collate: true
-    preprocess_qwen_inputs_in_collate: true
-    num_workers: 12
-    pin_memory: true
-    persistent_workers: true
-    prefetch_factor: 2
     load_all_data_for_training: true
     with_state: true
-  video_data:
-    dataset_py: video_datasets
-    video_dir: /home/WangBizi/datasets/ssv/videos_extracted/20bn-something-something-v2
-    text_file: /home/WangBizi/datasets/ssv/test-answers.csv
-    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics of future frames {actions}."
-    extensions: [webm]
-    resolution_size: 224
-    video_resolution_size: 256
-    per_device_batch_size: 8
     preprocess_vj_inputs_in_collate: true
     preprocess_qwen_inputs_in_collate: true
     num_workers: 8
-    decode_threads: 1
     pin_memory: true
     persistent_workers: true
     prefetch_factor: 2
+    augmentation:
+      enabled: true
+      camera_aug_policy: third_wrist_quarters
+      third_camera_index: 0
+      wrist_camera_index: 1
+      random_resized_crop:
+        scale: [0.9, 1.0]
+        ratio: [0.9, 1.1]
+      random_brightness: [0.2]
+      random_contrast: [0.8, 1.2]
+      random_saturation: [0.8, 1.2]
+      random_hue: [0.05]
+      random_gamma: [0.8, 1.25]
+      random_exposure_ev: [-0.25, 0.25]
+      gaussian_noise_std: 0.015
+      random_rotation_degrees: [-8, 8]
+      augment_order:
+        - random_resized_crop
+        - random_brightness
+        - random_contrast
+        - random_saturation
+        - random_hue
+        - random_gamma
+        - random_exposure_ev
+        - gaussian_noise
+        - random_rotation
 
 
 trainer:
+  enable_torch_compile: false
+  torch_compile_mode: reduce-overhead
+  torch_compile_modules: [vj_predictor, action_dit_blocks]
+  torch_compile_fullgraph: false
+  torch_compile_dynamic: false
+  torch_compile_threads: 4
+  enable_tf32: true
+  float32_matmul_precision: high
+  enable_fast_sdp: true
+  skip_qwen_lm_head: true
+
   epochs: 100
-  max_train_steps: 40000
-  num_warmup_steps: 4000
-  #num_warmup_steps: 0
-  save_interval: 2500
-  eval_interval: 5000
+  max_train_steps: 150005
+  num_warmup_steps: 0
+  num_steps_before_decay: 100000
+  save_interval: 10000
+  eval_interval: 10000
   learning_rate:
     base: 3.0e-05
     qwen_vl_interface: 1.0e-05
-    action_model: 1.0e-04
-  lr_scheduler_type: cosine_with_min_lr
+    action_model: 5.0e-04
+  lr_scheduler_type: multistep
   scheduler_specific_kwargs:
-    min_lr: 1.0e-06
+    milestones: [100000]
+    gamma: 0.1
   freeze_modules: ''
   loss_scale:
     vla: 1.0
     vlm: 0.1
     future: 0.1
   max_grad_norm: 1.0
-  warmup_ratio: 0.1
+  warmup_ratio: 0.0
   weight_decay: 0.0
-  logging_frequency: 1000000
+  logging_frequency: 10
   gradient_clipping: 1.0
-  gradient_accumulation_steps: 2
-  dataloader_warmup_steps: 4
-  pretrained_checkpoint: /home/WangBizi/VLA-JEPA/checkpoints/cotrain_future_QWen3.5_2B/checkpoints/Qwen3.5_contrain_steps_12500_pytorch_model.pt
+  gradient_accumulation_steps: 1
+  pretrained_checkpoint: /home/WangBizi/VLA-JEPA/checkpoints/cotrain_future_QWen3.5_2B/checkpoints/steps_30000_pytorch_model.pt
   ignore_mismatched_pretrained: true
-  
 
   optimizer:
     name: AdamW
@@ -135,10 +153,9 @@ trainer:
     eps: 1.0e-08
     weight_decay: 1.0e-08
 
-  # parameters to be determined
   is_resume: false
   resume_epoch: null
   resume_step: null
-  enable_gradient_checkpointing: true
-  enable_mixed_precision_training: true
+  enable_gradient_checkpointing: false
   enable_detailed_timing: true
+  enable_mixed_precision_training: true

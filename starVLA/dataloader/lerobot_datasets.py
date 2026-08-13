@@ -136,15 +136,38 @@ def _augment_video_frames(video, augmentation):
     return out if is_video else out[0]
 
 
+def _select_augmented_image_indices(augmentation, num_images):
+    policy = augmentation.get("camera_aug_policy", "all")
+    if policy in (None, "all"):
+        return set(range(num_images))
+    if policy != "third_wrist_quarters":
+        raise ValueError(f"Unsupported camera_aug_policy: {policy}")
+
+    third_camera_index = int(augmentation.get("third_camera_index", 0))
+    wrist_camera_index = int(augmentation.get("wrist_camera_index", 1))
+    selected_by_bucket = [
+        [],
+        [third_camera_index],
+        [wrist_camera_index],
+        [third_camera_index, wrist_camera_index],
+    ]
+    bucket = int(np.random.randint(4))
+    return {idx for idx in selected_by_bucket[bucket] if 0 <= idx < num_images}
+
+
 def _augment_example(example, augmentation):
     if not augmentation or not augmentation.get("enabled", False):
         return example["video"], example["image"]
 
     videos = np.asarray(example["video"])
     images = []
-    for image in example["image"]:
-        aug_image = _augment_video_frames(np.asarray(image), augmentation)
-        images.append(Image.fromarray(aug_image.astype(np.uint8)))
+    augmented_indices = _select_augmented_image_indices(augmentation, len(example["image"]))
+    for image_idx, image in enumerate(example["image"]):
+        if image_idx in augmented_indices:
+            aug_image = _augment_video_frames(np.asarray(image), augmentation)
+            images.append(Image.fromarray(aug_image.astype(np.uint8)))
+        else:
+            images.append(image)
     return videos, images
 
 
@@ -289,7 +312,9 @@ def make_LeRobotSingleDataset(
     )
     modality_config = data_config.modality_config()
     transforms = data_config.transform()
-    dataset_path = data_root_dir / data_name
+    dataset_path = Path(data_name)
+    if not dataset_path.is_absolute():
+        dataset_path = Path(data_root_dir) / data_name
     if robot_type not in ROBOT_TYPE_TO_EMBODIMENT_TAG:
         print(f"Warning: Robot type {robot_type} not found in ROBOT_TYPE_TO_EMBODIMENT_TAG, using {EmbodimentTag.NEW_EMBODIMENT} as default")
         embodiment_tag = EmbodimentTag.NEW_EMBODIMENT

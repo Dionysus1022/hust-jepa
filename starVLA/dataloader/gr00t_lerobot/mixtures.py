@@ -21,6 +21,18 @@ DATASET_NAMED_MIXTURES = {
                 # ("libero_90_no_noops_lerobot", 1.0, "libero_franka"),
     ],
 
+    "libero_plus": [
+        ("/data/LiYuhang/datasets/LIBERO-plus/libero_plus_lerobot", 1.0, "libero_franka"),
+    ],
+
+    "libero_all_plus": [
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("/data/LiYuhang/datasets/LIBERO-plus/libero_plus_lerobot", 1.0, "libero_franka"),
+    ],
+
     "droid": [
         ("", 1.0, "libero_franka"),
     ],
