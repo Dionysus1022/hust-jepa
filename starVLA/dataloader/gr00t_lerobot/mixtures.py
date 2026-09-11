@@ -61,6 +61,12 @@ DATASET_NAMED_MIXTURES = {
     "bridge": [
         ("bridge_orig_1.0.0_lerobot", 1.0, "oxe_bridge"),
     ],
+    "widowx": [
+        ("bridge_orig_1.0.0_lerobot", 1.0, "oxe_bridge"),
+    ],
+    "google_robot": [
+        ("fractal20220817_data_0.1.0_lerobot", 1.0, "oxe_rt1"),
+    ],
     "bridge_rt_1": [
         ("bridge_orig_1.0.0_lerobot", 1.0, "oxe_bridge"),
         ("fractal20220817_data_0.1.0_lerobot", 1.0, "oxe_rt1"),

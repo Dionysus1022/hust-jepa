@@ -44,6 +44,10 @@ class BatchedWebsocketPolicyServer:
                 self._port,
                 compression=None,
                 max_size=None,
+                # Model inference runs synchronously in the queue worker and can
+                # block the event loop longer than the default keepalive timeout.
+                ping_interval=None,
+                ping_timeout=None,
             ) as server:
                 await server.serve_forever()
         finally:

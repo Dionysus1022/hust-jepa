@@ -18,7 +18,7 @@ export TMPDIR=/home/dataset-local/tmp
 export FFMPEG_THREADS=1
 export OMP_NUM_THREADS=1
 export WANDB_MODE=disabled
-export CUDA_VISIBLE_DEVICES=2,3
+export CUDA_VISIBLE_DEVICES=0,1
 
 accelerate launch \
   --main_process_port "${MASTER_PORT}" \

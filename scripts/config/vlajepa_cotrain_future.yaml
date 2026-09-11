@@ -75,12 +75,18 @@ datasets:
     per_device_batch_size: 24
     preprocess_vj_inputs_in_collate: true
     preprocess_qwen_inputs_in_collate: true
-    num_workers: 12
+    num_workers: 6
+    # Explicitly cap PyAV codec threads per DataLoader worker; do not use
+    # FFmpeg's automatic thread count on this high-core host.
+    video_decode_threads: 2
     pin_memory: true
     persistent_workers: true
     prefetch_factor: 2
     load_all_data_for_training: true
     with_state: true
+    # Causal proprio history: [t-7, ..., t]. Video remains [t, ..., t+7]
+    # because future video is a JEPA training target, not a policy input.
+    state_history_len: 8
   video_data:
     dataset_py: video_datasets
     video_dir: /home/WangBizi/datasets/ssv/videos_extracted/20bn-something-something-v2
@@ -92,7 +98,7 @@ datasets:
     per_device_batch_size: 8
     preprocess_vj_inputs_in_collate: true
     preprocess_qwen_inputs_in_collate: true
-    num_workers: 8
+    num_workers: 4
     decode_threads: 1
     pin_memory: true
     persistent_workers: true
@@ -121,11 +127,12 @@ trainer:
   max_grad_norm: 1.0
   warmup_ratio: 0.1
   weight_decay: 0.0
-  logging_frequency: 1000000
+  logging_frequency: 10
+  progress_refresh_interval: 10
   gradient_clipping: 1.0
   gradient_accumulation_steps: 2
   dataloader_warmup_steps: 4
-  pretrained_checkpoint: /home/WangBizi/VLA-JEPA/checkpoints/cotrain_future_QWen3.5_2B/checkpoints/Qwen3.5_contrain_steps_12500_pytorch_model.pt
+  # pretrained_checkpoint: /home/WangBizi/VLA-JEPA/checkpoints/cotrain_future_QWen3.5_2B/checkpoints/Qwen3.5_contrain_steps_12500_pytorch_model.pt
   ignore_mismatched_pretrained: true
   
 
@@ -141,4 +148,6 @@ trainer:
   resume_step: null
   enable_gradient_checkpointing: true
   enable_mixed_precision_training: true
+  # Per-op CUDA timing forces frequent device synchronization; enable only
+  # for short profiling runs, not throughput training.
   enable_detailed_timing: true

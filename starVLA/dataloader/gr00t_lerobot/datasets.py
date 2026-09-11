@@ -27,6 +27,8 @@ See `scripts/load_dataset.py` for examples on how to use these datasets.
 
 import hashlib
 import json
+import os
+import fcntl
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
@@ -51,7 +53,12 @@ from starVLA.dataloader.gr00t_lerobot.schema import (
     LeRobotStateActionMetadata,
 )
 from starVLA.dataloader.gr00t_lerobot.transform import ComposedModalityTransform
-from starVLA.libero_proprio import droid_state_8d_to_proprio_7d, libero_state_8d_to_normalized_proprio
+from starVLA.libero_proprio import (
+    droid_state_8d_to_normalized_proprio,
+    libero_state_8d_to_normalized_proprio,
+    oxe_bridge_state_8d_to_normalized_proprio,
+    oxe_rt1_state_8d_to_normalized_proprio,
+)
 
 from functools import partial
 from typing import Tuple, List
@@ -65,6 +72,7 @@ LE_ROBOT_STATS_FILENAME = "meta/stats_gr00t.json"
 LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
 EPSILON = 5e-4
+STEPS_CACHE_VERSION = 2
 
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
     """Calculate the dataset statistics of all columns for a list of parquet files."""
@@ -172,6 +180,17 @@ class LeRobotSingleDataset(Dataset):
         self.curr_traj_id = None
 
         self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
+        trajectory_id_to_index = {
+            int(trajectory_id): index
+            for index, trajectory_id in enumerate(self._trajectory_ids)
+        }
+        if len(trajectory_id_to_index) != len(self._trajectory_ids):
+            raise ValueError("Trajectory IDs must be unique within a LeRobot dataset")
+        self._trajectory_id_to_index = trajectory_id_to_index
+        # Pandas stores vector-valued parquet columns as one array per row.
+        # Stack each shared state/action column once for the active trajectory;
+        # DataLoader workers each own an independent dataset/cache instance.
+        self._curr_traj_array_cache: dict[str, np.ndarray] = {}
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
         self._all_steps = self._get_all_steps()
@@ -399,43 +418,39 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             list[tuple[str, int]]: A list of (trajectory_id, base_index) tuples.
         """
-        # Create a hash key based on configuration to ensure cache validity
-        config_key = self._get_steps_config_key()
-        
-        # Create a unique filename based on config_key
-        steps_filename = f"steps_{config_key}.pkl"
-        # @BUG
-        # fast get static steps @fangjing --> don't use hash to dynamic sample
-        steps_filename =  "steps_data_index.pkl"
-        steps_filename = "steps_332420bad1ab.pkl"
+        cache_config = self._get_steps_cache_config()
+        config_key = self._get_steps_config_key(cache_config)
+        steps_path = self.dataset_path / "meta" / f"steps_{config_key}.pkl"
+        lock_path = steps_path.with_suffix(steps_path.suffix + ".lock")
+        steps_path.parent.mkdir(parents=True, exist_ok=True)
 
-        steps_path = self.dataset_path / "meta" / steps_filename
-        
-        # Try to load cached steps first
-        try:
+        # Dataset construction happens independently on every distributed rank.
+        # Serialize cache creation so ranks do not compute or overwrite it together.
+        with open(lock_path, "a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
             if steps_path.exists():
-                with open(steps_path, "rb") as f:
-                    cached_data = pickle.load(f)
-                return cached_data["steps"]
-            else:
-                steps_filename = "steps_2d5a34b904d2.pkl"
-                steps_path = self.dataset_path / "meta" / steps_filename
-        
-                with open(steps_path, "rb") as f:
-                    cached_data = pickle.load(f)
-                return cached_data["steps"]
+                try:
+                    with open(steps_path, "rb") as cache_file:
+                        cached_data = pickle.load(cache_file)
+                    self._validate_steps_cache(cached_data, cache_config, config_key)
+                    print(
+                        f"Loaded validated steps cache {steps_path} "
+                        f"(delete_pause_frame={self.delete_pause_frame}, "
+                        f"total_steps={len(cached_data['steps'])})"
+                    )
+                    return cached_data["steps"]
+                except (OSError, EOFError, pickle.PickleError, KeyError, TypeError, ValueError) as e:
+                    print(f"Ignoring invalid steps cache {steps_path}: {e}")
 
-
-        except (FileNotFoundError, pickle.PickleError, KeyError) as e:
-            print(f"Failed to load cached steps: {e}")
-            print("Computing steps from scratch...")
-
-        # Compute steps using single process
-        all_steps = self._get_all_steps_single_process()
-        
-        # Cache the computed steps with unique filename
-        try:
+            print(
+                "Computing steps from scratch for "
+                f"delete_pause_frame={self.delete_pause_frame}..."
+            )
+            all_steps = self._get_all_steps_single_process()
             cache_data = {
+                "cache_version": STEPS_CACHE_VERSION,
+                "cache_config": cache_config,
                 "config_key": config_key,
                 "steps": all_steps,
                 "num_trajectories": len(self.trajectory_ids),
@@ -443,31 +458,87 @@ class LeRobotSingleDataset(Dataset):
                 "computed_timestamp": pd.Timestamp.now().isoformat(),
                 "delete_pause_frame": self.delete_pause_frame,
             }
-            
-            # Ensure the meta directory exists
-            steps_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(steps_path, "wb") as f:
-                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"Cached steps saved to {steps_path}")
-        except Exception as e:
-            print(f"Failed to cache steps: {e}")
-        
-        return all_steps
 
-    def _get_steps_config_key(self) -> str:
-        """Generate a configuration key for steps caching."""
-        config_dict = {
-            "delete_pause_frame": self.delete_pause_frame,
+            # Write atomically so an interrupted process can never leave a
+            # partially written pickle that another rank silently consumes.
+            temporary_path = steps_path.with_name(f"{steps_path.name}.tmp.{os.getpid()}")
+            try:
+                with open(temporary_path, "wb") as cache_file:
+                    pickle.dump(cache_data, cache_file, protocol=pickle.HIGHEST_PROTOCOL)
+                    cache_file.flush()
+                    os.fsync(cache_file.fileno())
+                os.replace(temporary_path, steps_path)
+                print(f"Cached steps saved to {steps_path}")
+            finally:
+                if temporary_path.exists():
+                    temporary_path.unlink()
+
+            return all_steps
+
+    def _get_steps_cache_config(self) -> dict:
+        """Return every input that can change the set of cached sample anchors."""
+        return {
+            "cache_version": STEPS_CACHE_VERSION,
             "dataset_name": self.dataset_name,
+            "delete_pause_frame": self.delete_pause_frame,
+            "num_trajectories": len(self.trajectory_ids),
+            "total_frames": int(np.sum(self.trajectory_lengths)),
+            "pause_filter_version": 1 if self.delete_pause_frame else None,
+            "pause_translation_epsilon": EPSILON if self.delete_pause_frame else None,
         }
-        # Create a hash of the configuration
-        config_str = str(sorted(config_dict.items()))
-        return hashlib.md5(config_str.encode()).hexdigest()[:12]  #
+
+    def _get_steps_config_key(self, cache_config: dict | None = None) -> str:
+        """Generate a configuration key for steps caching."""
+        if cache_config is None:
+            cache_config = self._get_steps_cache_config()
+        config_json = json.dumps(cache_config, sort_keys=True, separators=(",", ":"))
+        return hashlib.md5(config_json.encode()).hexdigest()[:12]
+
+    def _validate_steps_cache(
+        self, cached_data: object, expected_config: dict, expected_key: str
+    ) -> None:
+        """Reject stale or malformed caches instead of silently changing sampling."""
+        if not isinstance(cached_data, dict):
+            raise ValueError(f"expected a dict, got {type(cached_data).__name__}")
+        if cached_data.get("cache_version") != STEPS_CACHE_VERSION:
+            raise ValueError(
+                f"cache_version={cached_data.get('cache_version')!r}, "
+                f"expected {STEPS_CACHE_VERSION}"
+            )
+        if cached_data.get("config_key") != expected_key:
+            raise ValueError(
+                f"config_key={cached_data.get('config_key')!r}, expected {expected_key!r}"
+            )
+        if cached_data.get("cache_config") != expected_config:
+            raise ValueError("cache configuration does not match the active dataset configuration")
+        steps = cached_data.get("steps")
+        if not isinstance(steps, list):
+            raise ValueError("cache does not contain a list named 'steps'")
+        if cached_data.get("total_steps") != len(steps):
+            raise ValueError(
+                f"total_steps={cached_data.get('total_steps')!r}, actual={len(steps)}"
+            )
 
 
     def _get_all_steps_single_process(self) -> list[tuple[int, int]]:
         """Original single-process implementation as fallback."""
+        if not self.delete_pause_frame:
+            # No trajectory contents are needed when every metadata-valid frame
+            # is an eligible anchor. This avoids scanning all parquet files just
+            # to reconstruct the index already described by episodes.jsonl.
+            all_steps = [
+                (int(trajectory_id), base_index)
+                for trajectory_id, trajectory_length in zip(
+                    self.trajectory_ids, self.trajectory_lengths
+                )
+                for base_index in range(int(trajectory_length))
+            ]
+            print(
+                f"Full-step summary: {len(all_steps)} steps from "
+                f"{len(self.trajectory_ids)} trajectories"
+            )
+            return all_steps
+
         all_steps: list[tuple[int, int]] = []
         skipped_trajectories = 0
         processed_trajectories = 0
@@ -794,13 +865,20 @@ class LeRobotSingleDataset(Dataset):
         """Get the data for a trajectory."""
         if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
             return self.curr_traj_data
-        else:
-            chunk_index = self.get_episode_chunk(trajectory_id)
-            parquet_path = self.dataset_path / self.data_path_pattern.format(
-                episode_chunk=chunk_index, episode_index=trajectory_id
-            )
-            assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-            return pd.read_parquet(parquet_path)
+
+        chunk_index = self.get_episode_chunk(trajectory_id)
+        parquet_path = self.dataset_path / self.data_path_pattern.format(
+            episode_chunk=chunk_index, episode_index=trajectory_id
+        )
+        assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
+        trajectory_data = pd.read_parquet(parquet_path)
+
+        # Only publish the new cache after a successful read, so a failed read
+        # cannot leave curr_traj_id pointing at stale trajectory contents.
+        self.curr_traj_id = trajectory_id
+        self.curr_traj_data = trajectory_data
+        self._curr_traj_array_cache.clear()
+        return trajectory_data
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
         """Get the index of the trajectory in the dataset by the trajectory ID.
@@ -812,12 +890,23 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             int: The index of the trajectory in the dataset.
         """
-        trajectory_indices = np.where(self.trajectory_ids == trajectory_id)[0]
-        if len(trajectory_indices) != 1:
-            raise ValueError(
-                f"Error finding trajectory index for {trajectory_id}, found {trajectory_indices=}"
-            )
-        return trajectory_indices[0]
+        try:
+            return self._trajectory_id_to_index[int(trajectory_id)]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Error finding trajectory index for {trajectory_id}") from exc
+
+    def _get_cached_trajectory_array(self, key: str) -> np.ndarray:
+        """Return a vector-valued parquet column stacked once per trajectory."""
+        assert self.curr_traj_data is not None, "No current trajectory data is loaded"
+        assert key in self.curr_traj_data.columns, f"No {key} found in current trajectory"
+        if key not in self._curr_traj_array_cache:
+            data_array = np.stack(self.curr_traj_data[key])  # type: ignore[arg-type]
+            if data_array.ndim != 2:
+                raise ValueError(
+                    f"Expected a 2D trajectory array for {key}, got shape {data_array.shape}"
+                )
+            self._curr_traj_array_cache[key] = data_array
+        return self._curr_traj_array_cache[key]
 
     def get_episode_chunk(self, ep_index: int) -> int:
         """Get the chunk index for an episode index."""
@@ -963,23 +1052,22 @@ class LeRobotSingleDataset(Dataset):
         # Get the data array, shape: (T, D)
         assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
         assert le_key in self.curr_traj_data.columns, f"No {le_key} found in {trajectory_id=}"
-        data_array: np.ndarray = np.stack(self.curr_traj_data[le_key])  # type: ignore
-        assert data_array.ndim == 2, f"Expected 2D array, got key {le_key} is{data_array.shape} array"
+        data_array = self._get_cached_trajectory_array(le_key)
         le_indices = np.arange(
             le_state_or_action_cfg[key].start,
             le_state_or_action_cfg[key].end,
         )
         data_array = data_array[:, le_indices]
-        # Get the state or action configuration
-        state_or_action_cfg = getattr(self.metadata.modalities, modality)[key]
-
         # Pad the data
         return self.retrieve_data_and_pad(
             array=data_array,
             step_indices=step_indices,
             max_length=max_length,
-            # padding_strategy="first_last" if state_or_action_cfg.absolute else "zero",
-            padding_strategy="zero",           # HACK for realdata
+            # Absolute proprio is a physical pose, so a missing pre-episode
+            # history frame means "same as the first observation", not a
+            # synthetic all-zero pose. Keep the legacy zero padding for action
+            # targets, whose out-of-range values should contribute no motion.
+            padding_strategy="first_last" if modality == "state" else "zero",
         )
 
     def get_language(
@@ -1382,9 +1470,9 @@ class LeRobotMixtureDataset(Dataset):
         resolution_size: int = 224,
         video_resolution_size: int = 256,
         seed: int = 42,
-        metadata_config: dict = {
-            "percentile_mixing_method": "min_max",
-        },
+        sample_without_replacement: bool = False,
+        proprio_encoding: str = "dataset_default",
+        metadata_config: dict | None = None,
     ):
         """
         Initialize the mixture dataset.
@@ -1395,6 +1483,11 @@ class LeRobotMixtureDataset(Dataset):
             balance_dataset_weights (bool): If True, the weight of dataset will be multiplied by the total trajectory length of each dataset.
             balance_trajectory_weights (bool): If True, sample trajectories within a dataset weighted by their length; otherwise, use equal weighting.
             seed (int): Random seed for sampling.
+            sample_without_replacement (bool): If True, require a single source dataset and
+                map dataloader indices directly to transitions. Shuffling is then handled by
+                the dataloader, so every transition is visited once per epoch.
+            proprio_encoding (str): State representation returned by the dataset. Use
+                "vla_jepa_7d" for canonical [xyz, axis-angle, gripper] conditioning.
         """
         datasets: list[LeRobotSingleDataset] = []
         dataset_sampling_weights: list[float] = []
@@ -1417,7 +1510,28 @@ class LeRobotMixtureDataset(Dataset):
         self.with_state = with_state
         self.resolution_size = resolution_size
         self.video_resolution_size = video_resolution_size
+        self.sample_without_replacement = bool(sample_without_replacement)
+        self.proprio_encoding = str(proprio_encoding)
+        if self.proprio_encoding not in {"dataset_default", "vla_jepa_7d"}:
+            raise ValueError(
+                f"Invalid proprio_encoding: {self.proprio_encoding}. "
+                "Expected 'dataset_default' or 'vla_jepa_7d'."
+            )
+        if self.sample_without_replacement and len(self.datasets) != 1:
+            raise ValueError(
+                "sample_without_replacement requires exactly one source dataset; "
+                f"got {len(self.datasets)}"
+            )
         self._bad_steps = set()
+        metadata_config = metadata_config or {}
+        metadata_config.setdefault("percentile_mixing_method", "min_max")
+        metadata_config.setdefault("stats_strategy", "merged")
+        self.stats_strategy = metadata_config["stats_strategy"]
+        if self.stats_strategy not in {"merged", "per_dataset"}:
+            raise ValueError(
+                f"Invalid stats_strategy: {self.stats_strategy}. "
+                "Expected 'merged' or 'per_dataset'."
+            )
 
         # Set properties for sampling
 
@@ -1533,6 +1647,12 @@ class LeRobotMixtureDataset(Dataset):
         """Sample a single step from the dataset."""
         # return self.sampled_steps[index]
 
+        if self.sample_without_replacement:
+            dataset = self.datasets[0]
+            single_step_index = int(index) % len(dataset.all_steps)
+            trajectory_id, base_index = dataset.all_steps[single_step_index]
+            return dataset, trajectory_id, base_index
+
         # Set seed
         seed = index if self.mode != "train" else safe_hash((self.epoch, index, self.seed))
         rng = np.random.default_rng(seed)
@@ -1587,10 +1707,24 @@ class LeRobotMixtureDataset(Dataset):
 
     @staticmethod
     def _to_droid_vlanext_proprio(state: np.ndarray) -> np.ndarray:
-        """Convert DROID 8D EEF state history to 7D proprio by dropping the pad slot."""
+        """Convert DROID 8D EEF state history to canonical normalized 7D."""
         if state.shape[-1] != 8:
             return state
-        return droid_state_8d_to_proprio_7d(state).astype(state.dtype, copy=False)
+        return droid_state_8d_to_normalized_proprio(state).astype(state.dtype, copy=False)
+
+    @staticmethod
+    def _to_oxe_vlanext_proprio(dataset: LeRobotSingleDataset, state: np.ndarray) -> np.ndarray:
+        """Convert raw robot state to the canonical normalized 7D representation."""
+        if "droid" in dataset.dataset_name.lower():
+            return droid_state_8d_to_normalized_proprio(state)
+        if dataset.tag == EmbodimentTag.OXE_BRIDGE.value:
+            return oxe_bridge_state_8d_to_normalized_proprio(state)
+        if dataset.tag == EmbodimentTag.OXE_RT1.value:
+            return oxe_rt1_state_8d_to_normalized_proprio(state)
+        raise ValueError(
+            "proprio_encoding='vla_jepa_7d' currently supports DROID, OXE Bridge, "
+            f"and OXE RT-1 datasets, got dataset={dataset.dataset_name!r}, tag={dataset.tag!r}"
+        )
 
     def __getitem__(self, index: int) -> dict:
         """Get the data for a single trajectory and start index.
@@ -1611,7 +1745,14 @@ class LeRobotMixtureDataset(Dataset):
                 sampled_key = (id(dataset), trajectory_name, int(step))
                 if sampled_key in self._bad_steps:
                     raise RuntimeError(f"Skipping previously failed sample {trajectory_name}:{step}")
-                data = dataset.transforms(dataset.get_step_data(trajectory_name, step))    # video T = 1, action T = horizon
+                raw_data = dataset.get_step_data(trajectory_name, step)
+                raw_state = None
+                if self.with_state and self.proprio_encoding == "vla_jepa_7d":
+                    raw_state = np.concatenate(
+                        [np.asarray(raw_data[key]) for key in dataset.modality_keys["state"]],
+                        axis=1,
+                    )
+                data = dataset.transforms(raw_data)    # video T = 1, action T = horizon
                 
                 # Process all video keys dynamically
                 videos, images = [], []
@@ -1638,25 +1779,28 @@ class LeRobotMixtureDataset(Dataset):
 
                 return_dict = dict(action=action, image=images, lang=language, video=videos)
                 if self.with_state:
-                    state = []
-                    for state_key in dataset.modality_keys["state"]:
-                        state.append(data[state_key])
-                    state = np.concatenate(state, axis=1).astype(np.float16)
-                    dataset_name = dataset.dataset_name.lower()
-                    is_libero_dataset = "libero" in dataset_name
-                    is_droid_dataset = "droid" in dataset_name
-                    if (
-                        is_libero_dataset
-                        and "state.pad" in dataset.modality_keys["state"]
-                        and "state.gripper" in dataset.modality_keys["state"]
-                    ):
-                        state = self._to_libero_vlanext_proprio(state).astype(np.float16)
-                    elif (
-                        is_droid_dataset
-                        and "state.pad" in dataset.modality_keys["state"]
-                        and "state.gripper" in dataset.modality_keys["state"]
-                    ):
-                        state = self._to_droid_vlanext_proprio(state).astype(np.float16)
+                    if raw_state is not None:
+                        state = self._to_oxe_vlanext_proprio(dataset, raw_state).astype(np.float16)
+                    else:
+                        state = []
+                        for state_key in dataset.modality_keys["state"]:
+                            state.append(data[state_key])
+                        state = np.concatenate(state, axis=1).astype(np.float16)
+                        dataset_name = dataset.dataset_name.lower()
+                        is_libero_dataset = "libero" in dataset_name
+                        is_droid_dataset = "droid" in dataset_name
+                        if (
+                            is_libero_dataset
+                            and "state.pad" in dataset.modality_keys["state"]
+                            and "state.gripper" in dataset.modality_keys["state"]
+                        ):
+                            state = self._to_libero_vlanext_proprio(state).astype(np.float16)
+                        elif (
+                            is_droid_dataset
+                            and "state.pad" in dataset.modality_keys["state"]
+                            and "state.gripper" in dataset.modality_keys["state"]
+                        ):
+                            state = self._to_droid_vlanext_proprio(state).astype(np.float16)
                     return_dict["state"] = state
                 #print(videos[0].shape) #[horizon, H, W, 3]
                 #print(action.shape) #[horizon, action_dim]
@@ -1919,7 +2063,18 @@ class LeRobotMixtureDataset(Dataset):
                 "percentile_mixing_method": The method to mix the percentiles, either "weighted_average" or "min_max".
                     weighted_average: Use the weighted average of the percentiles using the weight used in sampling the datasets.
                     min_max: Use the min of the 1st percentile and max of the 99th percentile.
+                "stats_strategy": Either "merged" or "per_dataset". The latter keeps each dataset's normalization stats.
         """
+        if self.stats_strategy == "per_dataset":
+            self.tag = EmbodimentTag.NEW_EMBODIMENT.value
+            self.merged_metadata = {
+                self._dataset_statistics_key(dataset): dataset.metadata
+                for dataset in self.datasets
+            }
+            for dataset in self.datasets:
+                dataset.set_transforms_metadata(dataset.metadata)
+            return
+
         # If cached path is provided, try to load and apply
         if cached_statistics_path is not None:
             try:
@@ -1947,6 +2102,16 @@ class LeRobotMixtureDataset(Dataset):
         for dataset in self.datasets:
             dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
 
+    @staticmethod
+    def _dataset_statistics_key(dataset: LeRobotSingleDataset) -> str:
+        """Return a stable, user-facing key for per-dataset normalization stats."""
+        name = dataset.dataset_name
+        for suffix in ("_1.0.0_lerobot", "_lerobot"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+                break
+        return name or dataset.dataset_name
+
     def save_dataset_statistics(self, save_path: Path | str, format: str = "json") -> None:
         """
         Save merged dataset statistics to specified path in the required format.
@@ -1959,6 +2124,10 @@ class LeRobotMixtureDataset(Dataset):
         """
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.stats_strategy == "per_dataset":
+            self._save_per_dataset_statistics(save_path, format=format)
+            return
         
         # Build the data structure to save
         statistics_data = {}
@@ -2049,6 +2218,77 @@ class LeRobotMixtureDataset(Dataset):
         print(f"Merged dataset statistics saved to: {save_path}")
         print(f"Used action keys (reordered): {list(all_used_action_keys)}")
         print(f"Used state keys (reordered): {list(all_used_state_keys)}")
+
+    def _save_per_dataset_statistics(self, save_path: Path | str, format: str = "json") -> None:
+        """Save one action/state statistics block per source dataset."""
+        save_path = Path(save_path)
+        if format.lower() != "json":
+            raise ValueError(f"Unsupported format: {format}. Currently only 'json' is supported.")
+        if not str(save_path).endswith(".json"):
+            save_path = save_path.with_suffix(".json")
+
+        statistics_data = {}
+        for dataset in self.datasets:
+            base_key = self._dataset_statistics_key(dataset)
+            key = base_key
+            suffix = 2
+            while key in statistics_data:
+                key = f"{base_key}_{suffix}"
+                suffix += 1
+
+            used_action_keys, used_state_keys = get_used_modality_keys(dataset.modality_keys)
+            tag_stats = {}
+
+            if hasattr(dataset.metadata.statistics, "action") and dataset.metadata.statistics.action:
+                action_stats = dataset.metadata.statistics.action
+                non_gripper_keys = []
+                gripper_keys = []
+                for stat_key in action_stats.keys():
+                    if stat_key in used_action_keys:
+                        if "gripper" in stat_key.lower():
+                            gripper_keys.append(stat_key)
+                        else:
+                            non_gripper_keys.append(stat_key)
+                ordered_keys = non_gripper_keys + gripper_keys
+                filtered_action_stats = {
+                    stat_key: action_stats[stat_key]
+                    for stat_key in ordered_keys
+                }
+                if filtered_action_stats:
+                    combined_action_stats = combine_modality_stats(filtered_action_stats)
+                    combined_action_stats["mask"] = generate_action_mask_for_used_keys(
+                        dataset.metadata.modalities.action,
+                        ordered_keys,
+                    )
+                    tag_stats["action"] = combined_action_stats
+
+            if hasattr(dataset.metadata.statistics, "state") and dataset.metadata.statistics.state:
+                state_stats = dataset.metadata.statistics.state
+                non_gripper_keys = []
+                gripper_keys = []
+                for stat_key in state_stats.keys():
+                    if stat_key in used_state_keys:
+                        if "gripper" in stat_key.lower():
+                            gripper_keys.append(stat_key)
+                        else:
+                            non_gripper_keys.append(stat_key)
+                ordered_keys = non_gripper_keys + gripper_keys
+                filtered_state_stats = {
+                    stat_key: state_stats[stat_key]
+                    for stat_key in ordered_keys
+                }
+                if filtered_state_stats:
+                    tag_stats["state"] = combine_modality_stats(filtered_state_stats)
+
+            tag_stats["num_transitions"] = len(dataset)
+            tag_stats["num_trajectories"] = len(dataset.trajectory_ids)
+            statistics_data[key] = tag_stats
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(statistics_data, f, indent=2, ensure_ascii=False)
+
+        print(f"Per-dataset statistics saved to: {save_path}")
+        print(f"Dataset statistics keys: {list(statistics_data.keys())}")
 
     def _combine_modality_stats(self, modality_stats: dict) -> dict:
         """Backward compatibility wrapper."""

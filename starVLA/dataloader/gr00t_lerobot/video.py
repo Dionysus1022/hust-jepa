@@ -84,6 +84,8 @@ def get_frames_by_timestamps(
         video_path (str): Path to the video file.
         timestamps (list[int] | np.ndarray): Timestamps to retrieve frames for, in seconds.
         video_backend (str, optional): Video backend to use. Defaults to "decord".
+        video_backend_kwargs (dict): Backend options. ``torchvision_av`` accepts
+            ``num_threads`` and defaults it to 2 to keep dataloader workers bounded.
     Returns:
         np.ndarray: Frames at the specified timestamps.
     """
@@ -131,60 +133,74 @@ def get_frames_by_timestamps(
         return frames
     elif video_backend == "torchvision_av":
         torchvision.set_video_backend("pyav")
-        loaded_frames = []
-        loaded_ts = []
-        
+        target_ts = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+        if target_ts.size == 0:
+            raise ValueError("timestamps must contain at least one value")
+        if not np.isfinite(target_ts).all():
+            raise ValueError("timestamps must contain only finite values")
+
+        # All requested frames in LeRobot are from a short temporal window. Seek
+        # once to the keyframe preceding the earliest request, then decode that
+        # window sequentially. The previous implementation sought and decoded
+        # the same GOP once per timestamp, which made an 8-frame sample perform
+        # eight largely redundant AV1 decodes.
+        decoded_frames = []
+        decoded_ts = []
+        max_target_ts = float(target_ts.max())
+        decode_threads = int(video_backend_kwargs.get("num_threads", 2))
+        if decode_threads < 1:
+            raise ValueError(f"num_threads must be at least 1, got {decode_threads}")
         reader = None
+        codec_context = None
         try:
             reader = torchvision.io.VideoReader(video_path, "video")
-            
-            for target_ts in timestamps:
-                # Reset reader state
-                reader.seek(target_ts, keyframes_only=True)
-                
-                closest_frame = None
-                closest_ts_diff = float('inf')
-                
-                for frame in reader:
-                    current_ts = frame["pts"]
-                    current_diff = abs(current_ts - target_ts)
-                    
-                    if closest_frame is None:
-                        closest_frame = frame
-                    
-                    if current_diff < closest_ts_diff:
-                        # Release previous frame reference
-                        if closest_frame is not None:
-                            del closest_frame
-                        closest_ts_diff = current_diff
-                        closest_frame = frame
-                    else:
-                        # Difference started growing, stop search
-                        break
-                
-                if closest_frame is not None:
-                    frame_data = closest_frame["data"]
-                    if isinstance(frame_data, torch.Tensor):
-                        frame_data = frame_data.cpu().numpy()
-                    loaded_frames.append(frame_data)
-                    loaded_ts.append(closest_frame["pts"])
-                    
-                    # Immediately release frame reference
-                    del closest_frame
-                    
+            # torchvision's PyAV backend ignores VideoReader(num_threads=...).
+            # Its default codec thread_count=0 asks FFmpeg to create an automatic
+            # thread pool (up to roughly one thread per host CPU) for every
+            # dataloader worker. Configure the underlying codec before decoding
+            # to prevent thousands of lingering threads under multi-worker load.
+            codec_context = reader.container.streams.video[0].codec_context
+            codec_context.thread_count = decode_threads
+            reader.seek(float(target_ts.min()), keyframes_only=True)
+
+            for frame in reader:
+                current_ts = float(frame["pts"])
+                decoded_ts.append(current_ts)
+                decoded_frames.append(frame["data"])
+
+                # The first frame after the latest request is sufficient to
+                # decide its nearest neighbour. It also preserves the old
+                # implementation's preference for the earlier frame on ties.
+                if current_ts > max_target_ts:
+                    break
         finally:
-            # Thoroughly clean resources
+            # Close the PyAV container once per requested window. Avoid a forced
+            # full-process gc.collect() in this hot dataloader path.
             if reader is not None:
-                if hasattr(reader, '_c'):
+                if hasattr(reader, "_c"):
                     reader._c = None
-                if hasattr(reader, 'container'):
-                    reader.container.close()
-                    reader.container = None
-            # Force garbage collection
-            import gc
-            gc.collect()
-        
-        frames = np.array(loaded_frames)
+                container = getattr(reader, "container", None)
+                try:
+                    if codec_context is not None:
+                        codec_context.close()
+                finally:
+                    if container is not None:
+                        container.close()
+                        reader.container = None
+
+        if not decoded_frames:
+            raise RuntimeError(f"Unable to decode frames from video: {video_path}")
+
+        decoded_ts_array = np.asarray(decoded_ts, dtype=np.float64)
+        closest_indices = np.abs(decoded_ts_array[:, None] - target_ts[None, :]).argmin(axis=0)
+        selected_frames = []
+        for index in closest_indices:
+            frame_data = decoded_frames[int(index)]
+            if isinstance(frame_data, torch.Tensor):
+                frame_data = frame_data.cpu().numpy()
+            selected_frames.append(frame_data)
+
+        frames = np.stack(selected_frames, axis=0)
         return frames.transpose(0, 2, 3, 1)
     else:
         raise NotImplementedError

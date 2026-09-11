@@ -42,6 +42,10 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            # Model inference can take longer than the websockets default
+            # keepalive timeout; request/response traffic is the liveness check.
+            ping_interval=None,
+            ping_timeout=None,
         ) as server:
             await server.serve_forever()
 

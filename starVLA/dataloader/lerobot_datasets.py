@@ -6,7 +6,11 @@ import numpy as np
 import torch
 from PIL import Image
 
-from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset, LeRobotMixtureDataset
+from starVLA.dataloader.gr00t_lerobot.datasets import (
+    LeRobotMixtureDataset,
+    LeRobotSingleDataset,
+    ModalityConfig,
+)
 from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
 from starVLA.dataloader.gr00t_lerobot.data_config import ROBOT_TYPE_CONFIG_MAP
 from starVLA.dataloader.gr00t_lerobot.embodiment_tags import ROBOT_TYPE_TO_EMBODIMENT_TAG, EmbodimentTag
@@ -15,6 +19,14 @@ _VJ_PROCESSOR = None
 _VJ_PROCESSOR_PATH = None
 _QWEN_PROCESSOR = None
 _QWEN_PROCESSOR_PATH = None
+
+
+def causal_state_delta_indices(history_len: int = 8) -> list[int]:
+    """Return a past-to-current state window, e.g. [-7, ..., 0] for length 8."""
+    history_len = int(history_len)
+    if history_len <= 0:
+        raise ValueError(f"state_history_len must be positive, got {history_len}")
+    return list(range(1 - history_len, 1))
 
 
 def _sample_range(value, default):
@@ -85,6 +97,40 @@ def _augment_video_frames(video, augmentation):
         else:
             exposure_ev = float(np.random.uniform(float(exposure_ev_cfg[0]), float(exposure_ev_cfg[1])))
     gaussian_noise_std = float(augmentation.get("gaussian_noise_std", 0.0) or 0.0)
+    affine_cfg = augmentation.get("random_affine", None)
+    affine_apply = False
+    affine_angle = 0.0
+    affine_translate = (0, 0)
+    affine_scale = 1.0
+    if "random_affine" in order and affine_cfg is not None:
+        probability = float(affine_cfg.get("probability", 1.0))
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(f"random_affine.probability must be in [0, 1], got {probability}")
+
+        translate = tuple(float(value) for value in affine_cfg.get("translate", (0.0, 0.0)))
+        if len(translate) != 2 or any(value < 0.0 or value > 1.0 for value in translate):
+            raise ValueError(
+                "random_affine.translate must contain horizontal/vertical fractions in [0, 1]"
+            )
+
+        degrees = tuple(float(value) for value in affine_cfg.get("degrees", (0.0, 0.0)))
+        if len(degrees) == 1:
+            degrees = (-degrees[0], degrees[0])
+        if len(degrees) != 2 or degrees[0] > degrees[1]:
+            raise ValueError("random_affine.degrees must contain one magnitude or [min, max]")
+
+        scale = tuple(float(value) for value in affine_cfg.get("scale", (1.0, 1.0)))
+        if len(scale) != 2 or scale[0] <= 0.0 or scale[0] > scale[1]:
+            raise ValueError("random_affine.scale must be a positive [min, max] range")
+
+        affine_apply = bool(np.random.random() < probability)
+        if affine_apply:
+            affine_angle = float(np.random.uniform(degrees[0], degrees[1]))
+            affine_translate = (
+                int(round(np.random.uniform(-translate[0], translate[0]) * out_w)),
+                int(round(np.random.uniform(-translate[1], translate[1]) * out_h)),
+            )
+            affine_scale = float(np.random.uniform(scale[0], scale[1]))
     rotation_degrees = augmentation.get("random_rotation_degrees", None)
     rotation_angle = 0.0
     if rotation_degrees:
@@ -106,6 +152,24 @@ def _augment_video_frames(video, augmentation):
             if op == "random_resized_crop" and crop_params is not None:
                 i, j, h, w = crop_params
                 frame = TVF.resized_crop(frame, i, j, h, w, size=(out_h, out_w))
+            elif op == "random_affine" and affine_apply:
+                fill = tuple(
+                    np.asarray(frame, dtype=np.uint8)
+                    .reshape(-1, 3)
+                    .mean(axis=0)
+                    .round()
+                    .astype(np.uint8)
+                    .tolist()
+                )
+                frame = TVF.affine(
+                    frame,
+                    angle=affine_angle,
+                    translate=affine_translate,
+                    scale=affine_scale,
+                    shear=(0.0, 0.0),
+                    interpolation=InterpolationMode.BILINEAR,
+                    fill=fill,
+                )
             elif op == "random_brightness":
                 frame = TVF.adjust_brightness(frame, brightness)
             elif op == "random_contrast":
@@ -157,6 +221,12 @@ def _select_augmented_image_indices(augmentation, num_images):
 
 def _augment_example(example, augmentation):
     if not augmentation or not augmentation.get("enabled", False):
+        return example["video"], example["image"]
+
+    probability = float(augmentation.get("probability", 1.0))
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError(f"augmentation.probability must be in [0, 1], got {probability}")
+    if np.random.random() >= probability:
         return example["video"], example["image"]
 
     videos = np.asarray(example["video"])
@@ -295,6 +365,8 @@ def make_LeRobotSingleDataset(
     delete_pause_frame: bool = False,
     action_horizon: int = 7,
     video_horizon: int = 16,
+    state_delta_indices: Sequence[int] | None = None,
+    video_decode_threads: int = 2,
 ) -> LeRobotSingleDataset:
     """
     Make a LeRobotSingleDataset object.
@@ -311,6 +383,12 @@ def make_LeRobotSingleDataset(
         action_indices=list(range(action_horizon))
     )
     modality_config = data_config.modality_config()
+    if state_delta_indices is not None and "state" in modality_config:
+        state_config = modality_config["state"]
+        modality_config["state"] = ModalityConfig(
+            delta_indices=[int(index) for index in state_delta_indices],
+            modality_keys=list(state_config.modality_keys),
+        )
     transforms = data_config.transform()
     dataset_path = Path(data_name)
     if not dataset_path.is_absolute():
@@ -320,12 +398,18 @@ def make_LeRobotSingleDataset(
         embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
     else:
         embodiment_tag = ROBOT_TYPE_TO_EMBODIMENT_TAG[robot_type]
+    video_decode_threads = int(video_decode_threads)
+    if video_decode_threads < 1:
+        raise ValueError(
+            f"video_decode_threads must be at least 1, got {video_decode_threads}"
+        )
     return LeRobotSingleDataset(
         dataset_path=dataset_path,
         modality_configs=modality_config,
         transforms=transforms,
         embodiment_tag=embodiment_tag,
         video_backend="torchvision_av",
+        video_backend_kwargs={"num_threads": video_decode_threads},
         delete_pause_frame=delete_pause_frame,
     )
 
@@ -338,6 +422,7 @@ def get_vla_dataset(
     delete_pause_frame: bool = True,
     action_horizon: int = 7,
     video_horizon: int = 16,
+    proprio_encoding: str = "dataset_default",
     **kwargs: dict,
 ) -> LeRobotMixtureDataset:
     """
@@ -345,6 +430,21 @@ def get_vla_dataset(
     """
     data_root_dir = data_cfg.data_root_dir
     data_mix = data_cfg.data_mix
+    balance_dataset_weights = data_cfg.get("balance_dataset_weights", balance_dataset_weights)
+    balance_trajectory_weights = data_cfg.get("balance_trajectory_weights", balance_trajectory_weights)
+    sample_without_replacement = bool(data_cfg.get("sample_without_replacement", False))
+    metadata_config = data_cfg.get("metadata_config", {})
+    if OmegaConf.is_config(metadata_config):
+        metadata_config = OmegaConf.to_container(metadata_config, resolve=True)
+    metadata_config = dict(metadata_config)
+    metadata_config.setdefault(
+        "percentile_mixing_method",
+        data_cfg.get("percentile_mixing_method", "min_max"),
+    )
+    metadata_config.setdefault("stats_strategy", data_cfg.get("stats_strategy", "merged"))
+    state_delta_indices = causal_state_delta_indices(
+        data_cfg.get("state_history_len", 8)
+    )
     mixture_spec = DATASET_NAMED_MIXTURES[data_mix]
     included_datasets, filtered_mixture_spec = set(), []
     for d_name, d_weight, robot_type in mixture_spec:  
@@ -363,7 +463,11 @@ def get_vla_dataset(
                                                           robot_type, 
                                                           delete_pause_frame=delete_pause_frame, 
                                                           action_horizon=action_horizon,
-                                                          video_horizon=video_horizon), d_weight))
+                                                          video_horizon=video_horizon,
+                                                          state_delta_indices=state_delta_indices,
+                                                          video_decode_threads=data_cfg.get(
+                                                              "video_decode_threads", 2
+                                                          )), d_weight))
 
     return LeRobotMixtureDataset(
         dataset_mixture,
@@ -374,6 +478,9 @@ def get_vla_dataset(
         resolution_size=data_cfg.get("resolution_size", 224),
         video_resolution_size=data_cfg.get("video_resolution_size", 256),
         seed=seed,
+        sample_without_replacement=sample_without_replacement,
+        proprio_encoding=data_cfg.get("proprio_encoding", proprio_encoding),
+        metadata_config=metadata_config,
         **kwargs,
     )
 

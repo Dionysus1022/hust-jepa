@@ -102,10 +102,12 @@ def eval_libero(args: Args) -> None:
 
     model = M1Inference(
         policy_ckpt_path=args.pretrained_path,
+        unnorm_key=args.unnorm_key,
         host=args.host,
         port=args.port,
         image_size=args.resize_size,
         replan_steps=args.replan_steps,
+        gripper_encoding=args.gripper_encoding,
     )
 
     total_episodes, total_successes = 0, 0

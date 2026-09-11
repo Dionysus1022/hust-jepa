@@ -1,4 +1,4 @@
-run_id: simpler_ft_future_Qwen3.5_2B_dualgpu
+run_id: simpler_ft_widowx_state7d_Qwen3.5_2B
 run_root_dir: checkpoints/direct_ft/oxe
 seed: 42
 trackers:
@@ -17,7 +17,7 @@ framework:
     add_pos_embed: true
     max_seq_len: 1024
     action_dim: 7
-    state_dim: 8
+    state_dim: 7
     future_action_window_size: 6
     action_horizon: 7
     past_action_window_size: 0
@@ -49,7 +49,7 @@ framework:
     special_future_token: <|future_{}|>
     num_frames: 8
   vlanext_conditioning:
-    use_proprio_input_vlm: false
+    use_proprio_input_vlm: true
     use_soft_connector: true
     connector_depth: 2
     connector_num_heads: 4
@@ -63,7 +63,7 @@ datasets:
   vla_data:
     dataset_py: lerobot_datasets
     data_root_dir: /data/WangBizi/dataset
-    data_mix: bridge_rt_1
+    data_mix: widowx
     action_type: delta_ee
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
     resolution_size: 224
@@ -71,8 +71,12 @@ datasets:
     per_device_batch_size: 32
     load_all_data_for_training: true
     action_horizon: 7
-    with_state: false
+    with_state: true
+    state_history_len: 8
+    proprio_encoding: vla_jepa_7d
     delete_pause_frame: false
+    sample_without_replacement: true
+    shuffle: true
     preprocess_vj_inputs_in_collate: true
     preprocess_qwen_inputs_in_collate: true
     num_workers: 8
@@ -141,6 +145,7 @@ trainer:
     weight_decay: 1.0e-08
 
   is_resume: false
+  resume_from_checkpoint: null
   resume_epoch: null
   resume_step: null
   enable_gradient_checkpointing: false

@@ -990,7 +990,7 @@ CKPT_MAPPING = {
 
 parser = argparse.ArgumentParser()
 DEFAULT_MODEL_PATH = (
-    "/home/dataset-local/starVLA_A100/checkpoints/ssv2/setting1/oxe/JEVLA1_after_ssv2/checkpoints/steps_120000_pytorch_model.pt"
+    "/data/WangBizi/VLA_JEPA_models/pretrain_checkpoint/SimplerEnv/checkpoints/VLA-JEPA-SimplerEnv.pt"
 )
 
 parser.add_argument("--task", type=str, default="long_horizon_apple_in_drawer", help="task name")

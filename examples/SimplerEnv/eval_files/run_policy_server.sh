@@ -7,8 +7,9 @@ port=6680
 gpu_id=0
 # export DEBUG=true
 #export star_vla_python=/mnt/petrelfs/share/yejinhui/Envs/miniconda3/envs/starVLA/bin/python
+: "${star_vla_python:=/home/WangBizi/miniconda3/envs/VLA_JEPA/bin/python}"
 
-your_ckpt=/home/dataset-local/starVLA_A100/checkpoints/direct_ft/oxe/JEVLA_wo_human/checkpoints/steps_120000_pytorch_model.pt
+your_ckpt=${1:-/data/WangBizi/VLA_JEPA_models/pretrain_checkpoint/SimplerEnv/checkpoints/VLA-JEPA-SimplerEnv.pt}
 
 #### build output directory #####
 ckpt_dir=$(dirname "${your_ckpt}")
@@ -20,7 +21,7 @@ log_file="${output_server_dir}/${ckpt_name}_policy_server_${port}.log"
 
 
 #### run server #####
-CUDA_VISIBLE_DEVICES=${gpu_id} python deployment/model_server/server_policy.py \
+CUDA_VISIBLE_DEVICES=${gpu_id} "${star_vla_python}" deployment/model_server/server_policy.py \
     --ckpt_path ${your_ckpt} \
     --port ${port} \
     --use_bf16 \

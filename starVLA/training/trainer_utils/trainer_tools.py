@@ -6,7 +6,8 @@ Utility classes defining a Metrics container and multiple Trackers to enable mod
 endpoints (e.g., JSONL local logs, Weights & Biases).
 """
 
-from typing import Tuple
+from pathlib import Path
+from typing import Mapping, Tuple
 import re
 import json
 import numpy as np
@@ -16,6 +17,90 @@ import torch.distributed as dist
 from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def compose_vlajepa_loss(
+    output_dict: Mapping[str, torch.Tensor],
+    loss_scale: Mapping[str, float] | None = None,
+) -> torch.Tensor:
+    """Compose VLA-JEPA losses once, with explicit task-level scales.
+
+    ``action_dct_loss`` is already weighted by ``dct_loss_weight`` in the
+    model, but is intentionally kept separate from the base flow loss for
+    logging.  Both action terms receive the VLA scale exactly once.
+    """
+    if not output_dict:
+        raise ValueError("VLA-JEPA returned no loss components")
+
+    scales = loss_scale or {}
+    grouped_scales = {
+        "action_loss": float(scales.get("vla", 1.0)),
+        "action_dct_loss": float(scales.get("vla", 1.0)),
+        "wm_loss": float(scales.get("vlm", 1.0)),
+        "future_token_loss": float(scales.get("future", 1.0)),
+    }
+    unknown = set(output_dict) - set(grouped_scales)
+    if unknown:
+        raise KeyError(f"Unrecognized VLA-JEPA loss components: {sorted(unknown)}")
+
+    total = None
+    for name, value in output_dict.items():
+        scaled = value * grouped_scales[name]
+        total = scaled if total is None else total + scaled
+    assert total is not None
+    return total
+
+
+def resolve_accelerate_checkpoint(
+    checkpoint_dir: str | Path,
+    resume_from_checkpoint: str | Path | None,
+) -> Path:
+    """Resolve an explicit or latest complete Accelerate state directory."""
+    checkpoint_dir = Path(checkpoint_dir)
+    requested = None if resume_from_checkpoint is None else str(resume_from_checkpoint)
+    if requested and requested.lower() != "latest":
+        path = Path(requested).expanduser()
+        if path.is_file():
+            raise ValueError(
+                f"{path} is a model-only checkpoint and cannot restore optimizer/scheduler/RNG state. "
+                "Use it as trainer.pretrained_checkpoint with trainer.is_resume=false, or resume "
+                "from a steps_<N>/ Accelerate checkpoint directory."
+            )
+        if not path.is_dir():
+            raise FileNotFoundError(f"Resume checkpoint directory does not exist: {path}")
+        return path
+
+    candidates = []
+    for path in checkpoint_dir.glob("steps_*"):
+        if not path.is_dir() or not (path / "trainer_state.json").is_file():
+            continue
+        match = re.fullmatch(r"steps_(\d+)", path.name)
+        if match:
+            candidates.append((int(match.group(1)), path))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No complete Accelerate checkpoint directories found under {checkpoint_dir}"
+        )
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def read_accelerate_checkpoint_step(checkpoint_path: str | Path) -> int:
+    """Read the optimizer-step counter stored next to an Accelerate state."""
+    state = read_accelerate_checkpoint_metadata(checkpoint_path)
+    return int(state["completed_steps"])
+
+
+def read_accelerate_checkpoint_metadata(checkpoint_path: str | Path) -> dict:
+    """Read VLA-JEPA's trainer metadata stored beside an Accelerate state."""
+    checkpoint_path = Path(checkpoint_path)
+    state_path = checkpoint_path / "trainer_state.json"
+    if state_path.is_file():
+        with state_path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    match = re.fullmatch(r"steps_(\d+)", checkpoint_path.name)
+    if match:
+        return {"completed_steps": int(match.group(1))}
+    raise ValueError(f"Cannot infer completed step from checkpoint: {checkpoint_path}")
 
 
 # === Define Tracker Interface ===

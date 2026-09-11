@@ -30,6 +30,7 @@ class M1Inference:
         use_ddim: bool = True,
         num_ddim_steps: int = 10,
         replan_steps: int = 3,
+        gripper_encoding: str = "zero_one",
         adaptive_ensemble_alpha = 0.1,
         host="0.0.0.0",
         port=10095,
@@ -38,9 +39,9 @@ class M1Inference:
         # build client to connect server policy
         self.client = WebsocketClientPolicy(host, port)
         self.policy_setup = policy_setup
-        self.unnorm_key = unnorm_key
+        self.unnorm_key = self.resolve_unnorm_key(unnorm_key, policy_ckpt_path)
 
-        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
+        print(f"*** policy_setup: {policy_setup}, unnorm_key: {self.unnorm_key} ***")
         self.use_ddim = use_ddim
         self.num_ddim_steps = num_ddim_steps
         self.image_size = image_size
@@ -48,6 +49,12 @@ class M1Inference:
         self.action_ensemble = action_ensemble
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
         self.action_ensemble_horizon = action_ensemble_horizon
+        if gripper_encoding not in ("zero_one", "minus_one_one"):
+            raise ValueError(
+                "gripper_encoding must be 'zero_one' or 'minus_one_one', "
+                f"got {gripper_encoding!r}"
+            )
+        self.gripper_encoding = gripper_encoding
         self.sticky_action_is_on = False
         self.gripper_action_repeat = 0
         self.sticky_gripper_action = 0.0
@@ -133,7 +140,11 @@ class M1Inference:
             # import ipdb; ipdb.set_trace()
             normalized_actions = response["data"]["normalized_actions"] # B, chunk, D        
             normalized_actions = normalized_actions[0]    
-            self.raw_actions = self.unnormalize_actions(normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats)
+            self.raw_actions = self.unnormalize_actions(
+                normalized_actions=normalized_actions,
+                action_norm_stats=self.action_norm_stats,
+                gripper_encoding=self.gripper_encoding,
+            )
             if self.raw_actions.shape[0] < self.replan_steps:
                 raise RuntimeError(
                     f"Policy returned {self.raw_actions.shape[0]} actions, "
@@ -152,11 +163,22 @@ class M1Inference:
         return {"raw_action": raw_action, "raw_actions": raw_actions[:7]}
 
     @staticmethod
-    def unnormalize_actions(normalized_actions: np.ndarray, action_norm_stats: Dict[str, np.ndarray]) -> np.ndarray:
+    def unnormalize_actions(
+        normalized_actions: np.ndarray,
+        action_norm_stats: Dict[str, np.ndarray],
+        gripper_encoding: str = "zero_one",
+    ) -> np.ndarray:
         mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["min"], dtype=bool))
         action_high, action_low = np.array(action_norm_stats["max"]), np.array(action_norm_stats["min"])
         normalized_actions = np.clip(normalized_actions, -1, 1)
-        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1) 
+        if gripper_encoding == "zero_one":
+            normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1)
+        elif gripper_encoding == "minus_one_one":
+            # LIBERO-Plus native commands use -1=open and +1=close. Convert
+            # them to this interface's convention: 1=open and 0=close.
+            normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.0, 1, 0)
+        else:
+            raise ValueError(f"Unsupported gripper_encoding: {gripper_encoding!r}")
         actions = np.where(
             mask,
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
@@ -175,6 +197,12 @@ class M1Inference:
 
         unnorm_key = M1Inference._check_unnorm_key(norm_stats, unnorm_key)
         return norm_stats[unnorm_key]["action"]
+
+    @staticmethod
+    def resolve_unnorm_key(unnorm_key: str | None, policy_ckpt_path) -> str:
+        policy_ckpt_path = Path(policy_ckpt_path)
+        _, norm_stats = read_mode_config(policy_ckpt_path)
+        return M1Inference._check_unnorm_key(norm_stats, unnorm_key)
 
     @staticmethod
     def get_action_chunk_size(policy_ckpt_path):
@@ -232,6 +260,14 @@ class M1Inference:
                 f"used for un-normalizing actions: {norm_stats.keys()}"
             )
             unnorm_key = next(iter(norm_stats.keys()))
+
+        if unnorm_key not in norm_stats and len(norm_stats) == 1:
+            fallback_key = next(iter(norm_stats.keys()))
+            print(
+                f"Warning: requested unnorm_key `{unnorm_key}` is not available; "
+                f"falling back to sole checkpoint stats key `{fallback_key}`."
+            )
+            return fallback_key
 
         assert unnorm_key in norm_stats, (
             f"The `unnorm_key` you chose is not in the set of available dataset statistics, "

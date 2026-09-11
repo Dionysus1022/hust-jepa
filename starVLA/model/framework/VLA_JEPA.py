@@ -26,9 +26,35 @@ logger = initialize_overwatch(__name__)
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
 
+
+def _expand_vj_video_embeddings(
+    video_embeddings: torch.Tensor,
+    expand_indices: torch.Tensor | None,
+    expected_videos: int,
+) -> torch.Tensor:
+    """Expand uniquely encoded videos into sample-major logical view order."""
+    if expand_indices is None:
+        if video_embeddings.shape[0] != expected_videos:
+            raise RuntimeError(
+                f"Expected V-JEPA encoder to return {expected_videos} videos, "
+                f"got {video_embeddings.shape[0]}."
+            )
+        return video_embeddings
+
+    expand_indices = torch.as_tensor(expand_indices, dtype=torch.long)
+    if expand_indices.ndim != 1 or expand_indices.numel() != expected_videos:
+        raise RuntimeError(
+            "vj_feature_expand_indices must be a 1D tensor with B * V entries; "
+            f"expected {expected_videos}, got shape {tuple(expand_indices.shape)}."
+        )
+    return video_embeddings.index_select(
+        0, expand_indices.to(video_embeddings.device, non_blocking=True)
+    )
+
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
+from starVLA.model.modules.history_position_encoding import HistorySinusoidalEncoding
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
@@ -155,12 +181,17 @@ class VLA_JEPA(baseframework):
         self.dct_low_freq_weight = float(vlanext_cfg.get("dct_low_freq_weight", 5.0))
         self.dct_high_freq_weight = float(vlanext_cfg.get("dct_high_freq_weight", 0.0))
         self.proprio_projector = None
+        self.proprio_history_position = None
         if self.use_proprio_input_vlm:
             self.proprio_projector = nn.Sequential(
                 nn.Linear(self.config.framework.action_model.state_dim, vl_hidden_size),
                 nn.LayerNorm(vl_hidden_size),
                 nn.SiLU(),
                 nn.Linear(vl_hidden_size, vl_hidden_size),
+            )
+            self.proprio_history_position = HistorySinusoidalEncoding(
+                hidden_size=vl_hidden_size,
+                max_history_len=int(self.config.datasets.vla_data.get("state_history_len", 8)),
             )
         self.soft_connector = None
         if self.use_soft_connector:
@@ -402,6 +433,7 @@ class VLA_JEPA(baseframework):
             actions = examples.get("action", None)
             state = examples.get("state", None)
             vj_pixel_values_videos = examples.get("vj_pixel_values_videos", None)
+            vj_feature_expand_indices = examples.get("vj_feature_expand_indices", None)
             qwen_inputs = examples.get("qwen_inputs", None)
             vla_batch_size = examples.get("vla_batch_size", None)
         else:
@@ -411,6 +443,7 @@ class VLA_JEPA(baseframework):
             actions = [example["action"]for example in examples] if "action" in examples[0] else None # label [B， len, 7]
             state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
             vj_pixel_values_videos = None
+            vj_feature_expand_indices = None
             qwen_inputs = None
             vla_batch_size = None
             video_shape = None
@@ -592,6 +625,9 @@ class VLA_JEPA(baseframework):
                     "forward/proprio_projector_time",
                     lambda: self.proprio_projector(state_tensor),
                 )
+                proprio_condition_tokens = self.proprio_history_position(
+                    proprio_condition_tokens
+                )
 
             if self.use_soft_connector and self.soft_connector is not None:
                 soft_context = last_hidden[:embodied_batch_size]
@@ -637,6 +673,13 @@ class VLA_JEPA(baseframework):
                         if item is not None
                     ]
                     ready_count = sum(item.shape[0] for item in ready_videos)
+                    if vj_feature_expand_indices is not None:
+                        if len(ready_videos) != len(vj_pixel_values_videos):
+                            raise RuntimeError(
+                                "All V-JEPA inputs must be preprocessed when using "
+                                "vj_feature_expand_indices."
+                            )
+                        return torch.cat(ready_videos, dim=0)
                     if ready_count == expected_videos:
                         return torch.cat(ready_videos, dim=0)
                     if batch_videos is None:
@@ -649,6 +692,8 @@ class VLA_JEPA(baseframework):
                             videos=batch_videos[i], return_tensors="pt"
                         )["pixel_values_videos"].to(self.vj_encoder.device))
                     return torch.cat(input_videos, dim=0)
+                if vj_pixel_values_videos is not None and vj_feature_expand_indices is not None:
+                    return vj_pixel_values_videos.to(self.vj_encoder.device, non_blocking=True)
                 if vj_pixel_values_videos is not None and vj_pixel_values_videos.shape[0] == expected_videos:
                     return vj_pixel_values_videos.to(self.vj_encoder.device, non_blocking=True)
                 if vj_pixel_values_videos is not None and is_mixed_cotrain_batch:
@@ -678,13 +723,13 @@ class VLA_JEPA(baseframework):
                     "forward/vj_encoder_time",
                     lambda: self.vj_encoder.get_vision_features(pixel_values_videos=input_videos),
                 )
-                encoded_videos, num_video_tokens, video_embed_dim = video_embeddings.shape
                 expected_videos = B * V
-                if encoded_videos != expected_videos:
-                    raise RuntimeError(
-                        f"Expected V-JEPA encoder to return {expected_videos} videos "
-                        f"({B} batch * {V} views), got {encoded_videos}."
-                    )
+                video_embeddings = _expand_vj_video_embeddings(
+                    video_embeddings,
+                    vj_feature_expand_indices,
+                    expected_videos,
+                )
+                _, num_video_tokens, video_embed_dim = video_embeddings.shape
                 # VJ inputs are flattened sample-major: [b0v0, b0v1, b1v0, b1v1, ...].
                 video_embeddings = (
                     video_embeddings.reshape(B, V, num_video_tokens, video_embed_dim)
@@ -732,8 +777,7 @@ class VLA_JEPA(baseframework):
             self.last_forward_timing = timing
             result = {"wm_loss": teacher_forcing_wm_loss}
             if future_token_loss is not None:
-                future_loss_scale = float(self.config.trainer.get("loss_scale", {}).get("future", 1.0))
-                result["future_token_loss"] = future_token_loss * future_loss_scale
+                result["future_token_loss"] = future_token_loss
             return result
 
         # Step 4: Action Expert Forward and Loss
@@ -754,7 +798,7 @@ class VLA_JEPA(baseframework):
             action_condition_repeated = action_condition_tokens.repeat(repeated_diffusion_steps, 1, 1)
             
             state_repeated = None
-            if state is not None:
+            if state is not None and getattr(self.action_model, "use_state_encoder", True):
                 if state_tensor is None:
                     def move_state():
                         if torch.is_tensor(state):
@@ -783,7 +827,6 @@ class VLA_JEPA(baseframework):
                     action_details["pred_actions"].float(),
                     actions_target_repeated.float(),
                 ) * self.action_dct_loss_weight
-                action_loss = action_loss + action_dct_loss
             else:
                 action_loss = timed(
                     "forward/action_head_loss_time",
@@ -791,12 +834,13 @@ class VLA_JEPA(baseframework):
                 )  # (B, chunk_len, action_dim)
 
         self.last_forward_timing = timing
-        result = {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss * 0.1}
+        # Return disjoint raw task losses. Task-level loss_scale is applied in
+        # the trainer, while action_dct_loss already carries dct_loss_weight.
+        result = {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss}
         if action_dct_loss is not None:
             result["action_dct_loss"] = action_dct_loss
         if future_token_loss is not None:
-            future_loss_scale = float(self.config.trainer.get("loss_scale", {}).get("future", 1.0))
-            result["future_token_loss"] = future_token_loss * future_loss_scale
+            result["future_token_loss"] = future_token_loss
         return result
 
     @torch.inference_mode()
@@ -862,6 +906,9 @@ class VLA_JEPA(baseframework):
         proprio_condition_tokens = None
         if self.use_proprio_input_vlm and self.proprio_projector is not None and state is not None:
             proprio_condition_tokens = self.proprio_projector(state)
+            proprio_condition_tokens = self.proprio_history_position(
+                proprio_condition_tokens
+            )
         if self.use_soft_connector and self.soft_connector is not None:
             soft_context = last_hidden
             if proprio_condition_tokens is not None:
@@ -873,8 +920,14 @@ class VLA_JEPA(baseframework):
         action_condition_parts.append(embodied_action_tokens)
         action_condition_tokens = torch.cat(action_condition_parts, dim=1)
         # Step 4: Action Expert Forward and Loss
+        action_head_state = (
+            state if getattr(self.action_model, "use_state_encoder", True) else None
+        )
         with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(action_condition_tokens, state)  # (B, chunk_len, action_dim)
+            pred_actions = self.action_model.predict_action(
+                action_condition_tokens,
+                action_head_state,
+            )  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions, "embodied_action_tokens": action_condition_tokens.to(dtype=torch.float32).detach().cpu().numpy()}

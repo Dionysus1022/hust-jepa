@@ -113,15 +113,23 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
 
         vla_dataset = get_vla_dataset(
             data_cfg=vla_dataset_cfg,
+            delete_pause_frame=bool(vla_dataset_cfg.get("delete_pause_frame", True)),
             action_horizon=cfg.framework.action_model.action_horizon,
             video_horizon=cfg.framework.vj2_model.num_frames)
-        
+
+        shuffle = bool(vla_dataset_cfg.get("shuffle", False))
+        dataloader_generator = None
+        if shuffle:
+            dataloader_generator = torch.Generator()
+            dataloader_generator.manual_seed(int(cfg.seed))
+
         vla_train_dataloader = DataLoader(
             vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=custom_collate_fn,
+            shuffle=shuffle,
+            generator=dataloader_generator,
             **_dataloader_kwargs(vla_dataset_cfg, default_num_workers=8),
-            # shuffle=True
         )        
         if dist.get_rank() == 0: 
             
@@ -198,13 +206,22 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             qwen_embodied_action_token=embodied_action_token,
             qwen_future_tokens=future_tokens)
 
-        train_sampler = torch.utils.data.distributed.DistributedSampler(video_dataset, shuffle=True)
+        # Accelerator shards the prepared DataLoader across processes.  Adding a
+        # DistributedSampler here would shard SSV once before Accelerator shards
+        # it again, so a 4-rank job would expose only about 1/4 of the dataset per
+        # logical epoch.
+        shuffle = bool(video_dataset_cfg.get("shuffle", True))
+        dataloader_generator = None
+        if shuffle:
+            dataloader_generator = torch.Generator()
+            dataloader_generator.manual_seed(int(cfg.seed))
 
         video_train_dataloader = DataLoader(
             video_dataset,
             batch_size=video_dataset_cfg.per_device_batch_size,
             collate_fn=video_collate_fn,
-            sampler=train_sampler,
+            shuffle=shuffle,
+            generator=dataloader_generator,
             **_dataloader_kwargs(video_dataset_cfg, default_num_workers=16),
         )        
         return video_train_dataloader

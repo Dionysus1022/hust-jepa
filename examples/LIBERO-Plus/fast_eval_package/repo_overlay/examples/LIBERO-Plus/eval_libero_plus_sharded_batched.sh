@@ -33,6 +33,9 @@ max_servers_per_gpu=${max_servers_per_gpu:-7}
 server_start_timeout_s=${server_start_timeout_s:-900}
 num_trials_per_task=${num_trials_per_task:-1}
 max_steps=${max_steps:-}
+replan_steps=${replan_steps:-3}
+unnorm_key=${unnorm_key:-libero_plus}
+gripper_encoding=${gripper_encoding:-zero_one}
 with_state=${with_state:-true}
 save_video=${save_video:-false}
 dry_run=${dry_run:-false}
@@ -42,6 +45,10 @@ log_root=${log_root:-logs/libero_plus_sharded_${run_name}}
 
 if (( num_servers <= 0 )); then
     echo "gpu_ids_str must contain at least one GPU id" >&2
+    exit 1
+fi
+if [[ "${gripper_encoding}" != "zero_one" && "${gripper_encoding}" != "minus_one_one" ]]; then
+    echo "gripper_encoding must be zero_one or minus_one_one" >&2
     exit 1
 fi
 num_categories=${#items[@]}
@@ -238,6 +245,9 @@ do
             --args.num-trials-per-task "${num_trials_per_task}" \
             --args.category-value "${perturbation_name}" \
             --args.with-state "${with_state}" \
+            --args.replan-steps "${replan_steps}" \
+            --args.unnorm-key "${unnorm_key}" \
+            --args.gripper-encoding "${gripper_encoding}" \
             "${max_steps_args[@]}" \
             "${save_video_args[@]}" \
             --args.shard-index "${shard_index}" \

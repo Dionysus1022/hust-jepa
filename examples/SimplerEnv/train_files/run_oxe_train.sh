@@ -1,5 +1,5 @@
 export NCCL_IB_DISABLE=1
-export NCCL_SOCKET_IFNAME=eth0
+export NCCL_SOCKET_IFNAME=eno1
 # used for check save when communication
 export NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
@@ -12,7 +12,7 @@ export WANDB_MODE=disabled
 
 accelerate launch \
   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --num_processes 8 \
+  --num_processes 2 \
   starVLA/training/train_starvla.py \
   --config_yaml ./examples/SimplerEnv/train_files/vlajepa_ft.yaml \
   #--framework.name ${Framework_name} \

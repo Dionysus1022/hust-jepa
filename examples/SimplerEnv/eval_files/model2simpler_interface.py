@@ -1,6 +1,8 @@
 from collections import deque
 from typing import Optional, Sequence
+import json
 import os
+import warnings
 import cv2 as cv
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,7 +14,6 @@ from pathlib import Path
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
 from examples.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
-from starVLA.model.tools import read_mode_config
 
 
 
@@ -31,6 +32,7 @@ class ModelClient:
         num_ddim_steps: int = 10,
         action_ensemble = True,
         adaptive_ensemble_alpha = 0.1,
+        gripper_encoding: str = "zero_one",
         host="0.0.0.0",
         port=10093,
     ) -> None:
@@ -39,8 +41,15 @@ class ModelClient:
         self.client = WebsocketClientPolicy(host, port)
 
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        if gripper_encoding not in ("zero_one", "minus_one_one"):
+            raise ValueError(
+                "gripper_encoding must be 'zero_one' or 'minus_one_one', "
+                f"got {gripper_encoding!r}"
+            )
+        self.gripper_encoding = gripper_encoding
+
         if policy_setup == "widowx_bridge":
-            unnorm_key = "oxe_bridge" if unnorm_key is None else unnorm_key
+            default_unnorm_key = "oxe_bridge"
             action_ensemble = action_ensemble
             adaptive_ensemble_alpha = adaptive_ensemble_alpha
             if action_ensemble_horizon is None:
@@ -48,7 +57,7 @@ class ModelClient:
                 action_ensemble_horizon = 7
             self.sticky_gripper_num_repeat = 1
         elif policy_setup == "google_robot":
-            unnorm_key = "oxe_rt1" if unnorm_key is None else unnorm_key
+            default_unnorm_key = "oxe_rt1"
             action_ensemble = action_ensemble
             adaptive_ensemble_alpha = adaptive_ensemble_alpha
             if action_ensemble_horizon is None:
@@ -60,9 +69,12 @@ class ModelClient:
                 f"Policy setup {policy_setup} not supported for octo models. The other datasets can be found in the huggingface config.json file."
             )
         self.policy_setup = policy_setup
-        self.unnorm_key = unnorm_key
+        self.unnorm_key = self.resolve_unnorm_key(
+            unnorm_key if unnorm_key is not None else default_unnorm_key,
+            policy_ckpt_path,
+        )
 
-        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
+        print(f"*** policy_setup: {policy_setup}, unnorm_key: {self.unnorm_key} ***")
         self.use_ddim = use_ddim
         self.num_ddim_steps = num_ddim_steps
 
@@ -95,7 +107,12 @@ class ModelClient:
         self.image_history.append(image)
         self.num_image_history = min(self.num_image_history + 1, self.horizon)
 
-    def reset(self, task_description: str) -> None:
+    def reset(
+        self,
+        task_description: str,
+        *,
+        gripper_open_state: Optional[float] = None,
+    ) -> None:
         self.task_description = task_description
         self.image_history.clear()
         if self.action_ensemble:
@@ -105,10 +122,25 @@ class ModelClient:
         self.sticky_action_is_on = False
         self.gripper_action_repeat = 0
         self.sticky_gripper_action = 0.0
-        self.previous_gripper_action = None
+        if gripper_open_state is None:
+            self.previous_gripper_action = None
+        else:
+            # Google-robot policy outputs an absolute binary open-state, while
+            # SimplerEnv consumes relative gripper commands.  At a subtask
+            # boundary, anchor that conversion to the physical gripper instead
+            # of treating the first prediction as the current gripper state.
+            self.previous_gripper_action = np.asarray(
+                [np.clip(float(gripper_open_state), 0.0, 1.0)],
+                dtype=np.float64,
+            )
 
     def step(
-        self, image: np.ndarray, task_description: Optional[str] = None, *args, **kwargs
+        self,
+        image: np.ndarray,
+        task_description: Optional[str] = None,
+        state: Optional[np.ndarray] = None,
+        *args,
+        **kwargs,
     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """
         Input:
@@ -139,17 +171,25 @@ class ModelClient:
             "use_ddim": self.use_ddim,
             "num_ddim_steps": self.num_ddim_steps,
         }
-   
+        if state is not None:
+            vla_input["state"] = [state]
+
+        # Match the official VLA-JEPA SimplerEnv rollout: infer from the newest
+        # observation at every environment step, ensemble overlapping chunks,
+        # and execute only the ensembled action for the current step.
         response = self.client.infer(vla_input)
-        
-        
-        # unnormalize the action
-        normalized_actions = response["data"]["normalized_actions"] # B, chunk, D        
-        normalized_actions = normalized_actions[0]
-        
-        
-        raw_actions = self.unnormalize_actions(normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats)
-        
+        if not response.get("ok", response.get("status") == "ok"):
+            raise RuntimeError(f"Policy server inference failed: {response.get('error', response)}")
+        if "data" not in response:
+            raise RuntimeError(f"Policy server response missing `data`: {response}")
+        normalized_actions = response["data"]["normalized_actions"][0]
+        raw_actions = self.unnormalize_actions(
+            normalized_actions=normalized_actions,
+            action_norm_stats=self.action_norm_stats,
+            gripper_encoding=self.gripper_encoding,
+            # OXE Bridge and RT-1 actions are normalized with q01/q99.
+            use_quantiles=True,
+        )
         if self.action_ensemble:
             raw_actions = self.action_ensembler.ensemble_action(raw_actions)[None]
 
@@ -164,9 +204,14 @@ class ModelClient:
         action["world_vector"] = raw_action["world_vector"] * self.action_scale
         action_rotation_delta = np.asarray(raw_action["rotation_delta"], dtype=np.float64)
 
-        roll, pitch, yaw = action_rotation_delta
-        axes, angles = euler2axangle(roll, pitch, yaw)
-        action_rotation_axangle = axes * angles
+        if self.policy_setup in ("google_robot", "widowx_bridge"):
+            # Both Fractal/RT-1 and Bridge actions store rotation deltas as
+            # roll, pitch, yaw; SimplerEnv expects an axis-angle vector.
+            roll, pitch, yaw = action_rotation_delta
+            axes, angles = euler2axangle(roll, pitch, yaw)
+            action_rotation_axangle = axes * angles
+        else:
+            raise NotImplementedError(f"Unsupported policy setup: {self.policy_setup}")
         action["rot_axangle"] = action_rotation_axangle * self.action_scale
 
         if self.policy_setup == "google_robot":
@@ -203,11 +248,22 @@ class ModelClient:
         return raw_action, action
 
     @staticmethod
-    def unnormalize_actions(normalized_actions: np.ndarray, action_norm_stats: Dict[str, np.ndarray]) -> np.ndarray:
-        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
-        action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+    def unnormalize_actions(
+        normalized_actions: np.ndarray,
+        action_norm_stats: Dict[str, np.ndarray],
+        gripper_encoding: str = "zero_one",
+        use_quantiles: bool = True,
+    ) -> np.ndarray:
+        low_key, high_key = ("q01", "q99") if use_quantiles else ("min", "max")
+        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats[low_key], dtype=bool))
+        action_high, action_low = np.array(action_norm_stats[high_key]), np.array(action_norm_stats[low_key])
         normalized_actions = np.clip(normalized_actions, -1, 1)
-        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1) 
+        if gripper_encoding == "zero_one":
+            normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1)
+        elif gripper_encoding == "minus_one_one":
+            normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.0, 1, 0)
+        else:
+            raise ValueError(f"Unsupported gripper_encoding: {gripper_encoding!r}")
         actions = np.where(
             mask,
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
@@ -222,10 +278,52 @@ class ModelClient:
         Duplicate stats accessor (retained for backward compatibility).
         """
         policy_ckpt_path = Path(policy_ckpt_path)
-        model_config, norm_stats = read_mode_config(policy_ckpt_path)  # read config and norm_stats
+        if not policy_ckpt_path.is_file():
+            raise FileNotFoundError(f"Checkpoint does not exist: {policy_ckpt_path}")
+
+        dataset_statistics_path = policy_ckpt_path.parents[1] / "dataset_statistics.json"
+        if not dataset_statistics_path.is_file():
+            raise FileNotFoundError(
+                f"Missing dataset statistics next to checkpoint: {dataset_statistics_path}"
+            )
+
+        with dataset_statistics_path.open("r", encoding="utf-8") as file:
+            norm_stats = json.load(file)
 
         # unnorm_key = baseframework._check_unnorm_key(norm_stats, unnorm_key) # 其实也是很环境 specific 的
         return norm_stats[unnorm_key]["action"]
+
+    @staticmethod
+    def resolve_unnorm_key(unnorm_key: str | None, policy_ckpt_path) -> str:
+        norm_stats = ModelClient._read_dataset_statistics(policy_ckpt_path)
+        if unnorm_key is None:
+            if len(norm_stats) != 1:
+                raise ValueError(
+                    "Checkpoint contains multiple dataset statistics keys; choose one of "
+                    f"{sorted(norm_stats)} with unnorm_key."
+                )
+            return next(iter(norm_stats))
+        if unnorm_key not in norm_stats and len(norm_stats) == 1:
+            fallback_key = next(iter(norm_stats))
+            warnings.warn(
+                f"Requested unnorm_key {unnorm_key!r} is unavailable; "
+                f"falling back to the checkpoint's only key {fallback_key!r}."
+            )
+            return fallback_key
+        if unnorm_key not in norm_stats:
+            raise ValueError(f"Unknown unnorm_key {unnorm_key!r}; choose from {sorted(norm_stats)}")
+        return unnorm_key
+
+    @staticmethod
+    def _read_dataset_statistics(policy_ckpt_path) -> dict:
+        policy_ckpt_path = Path(policy_ckpt_path)
+        dataset_statistics_path = policy_ckpt_path.parents[1] / "dataset_statistics.json"
+        if not dataset_statistics_path.is_file():
+            raise FileNotFoundError(
+                f"Missing dataset statistics next to checkpoint: {dataset_statistics_path}"
+            )
+        with dataset_statistics_path.open("r", encoding="utf-8") as file:
+            return json.load(file)
 
 
 

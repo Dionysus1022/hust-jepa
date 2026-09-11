@@ -179,7 +179,19 @@ def collate_fn(
         processor = _get_vj_processor(vj_processor_path)
         videos_for_processor = single_view_videos_np.transpose(0, 1, 4, 2, 3)  # [B, T, C, H, W]
         processed = _process_vj_videos(processor, videos_for_processor)
-        collated["vj_pixel_values_videos"] = processed.repeat_interleave(n_views, dim=0)
+        if not torch.is_tensor(processed) or processed.shape[0] != B:
+            actual_shape = getattr(processed, "shape", None)
+            raise RuntimeError(
+                "SSV V-JEPA preprocessing must preserve one physical video per sample; "
+                f"expected first dimension {B}, got {actual_shape}."
+            )
+        # SSV has one physical camera stream. Both logical JEPA views are the
+        # same video, so encode each sample once and duplicate the frozen
+        # encoder features later instead of running V-JEPA twice.
+        collated["vj_pixel_values_videos"] = processed
+        collated["vj_feature_expand_indices"] = torch.arange(
+            B, dtype=torch.long
+        ).repeat_interleave(n_views)
 
     return collated
 

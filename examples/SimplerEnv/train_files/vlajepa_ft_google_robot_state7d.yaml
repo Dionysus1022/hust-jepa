@@ -1,5 +1,5 @@
-run_id: robot_ft_future_Qwen3.5_2B
-run_root_dir: checkpoints
+run_id: simpler_ft_google_robot_state7d_Qwen3.5_2B_plus
+run_root_dir: checkpoints/direct_ft/oxe
 seed: 42
 trackers:
 - json
@@ -18,6 +18,7 @@ framework:
     max_seq_len: 1024
     action_dim: 7
     state_dim: 7
+    use_state_encoder: false
     future_action_window_size: 6
     action_horizon: 7
     past_action_window_size: 0
@@ -59,21 +60,24 @@ framework:
     dct_low_freq_weight: 5.0
     dct_high_freq_weight: 0.0
   reduce_in_full_precision: true
-
-
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    data_root_dir: /home/WangBizi/VLA-JEPA/dataset/LeRobot/LEROBOT_LIBERO_DATA
-    data_mix: libero_all
-    action_type: delta_qpos
+    data_root_dir: /data/WangBizi/dataset
+    data_mix: google_robot
+    action_type: delta_ee
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
-    #CoT_answer: bbox
-    resolution_size: 224   # image input of VLA will be resized and video will not, video will be precessed by world model videoprocessor
-    per_device_batch_size: 16
+    resolution_size: 224
     video_resolution_size: 256
+    per_device_batch_size: 32
     load_all_data_for_training: true
+    action_horizon: 7
     with_state: true
+    state_history_len: 8
+    proprio_encoding: vla_jepa_7d
+    delete_pause_frame: false
+    sample_without_replacement: true
+    shuffle: true
     preprocess_vj_inputs_in_collate: true
     preprocess_qwen_inputs_in_collate: true
     num_workers: 8
@@ -82,31 +86,27 @@ datasets:
     prefetch_factor: 2
     augmentation:
       enabled: true
-      camera_aug_policy: third_wrist_quarters
-      third_camera_index: 0   # video.primary_image / third-person camera
-      wrist_camera_index: 1   # video.wrist_image
+      probability: 0.5
+      camera_aug_policy: all
       random_resized_crop:
-        scale: [0.8, 1.0]
-        ratio: [0.9, 1.1]
-      random_brightness: [0.2]
-      random_contrast: [0.8, 1.2]
-      random_saturation: [0.8, 1.2]
-      random_hue: [0.05]
-      random_gamma: [0.8, 1.25]
-      random_exposure_ev: [-0.25, 0.25]
-      gaussian_noise_std: 0.015
-      random_rotation_degrees: [-8, 8]
+        scale: [0.9, 1.0]
+        ratio: [0.95, 1.05]
+      random_affine:
+        translate: [0.2, 0.08]
+        scale: [0.9, 1.1]
+        degrees: [-3.0, 3.0]
+        probability: 0.7
+      random_brightness: [0.15]
+      random_contrast: [0.9, 1.1]
+      random_saturation: [0.9, 1.1]
+      random_hue: [0.03]
       augment_order:
         - random_resized_crop
+        - random_affine
         - random_brightness
         - random_contrast
         - random_saturation
         - random_hue
-        - random_gamma
-        - random_exposure_ev
-        - gaussian_noise
-        - random_rotation
-
 
 trainer:
   enable_torch_compile: false
@@ -123,7 +123,6 @@ trainer:
   epochs: 100
   max_train_steps: 30000
   num_warmup_steps: 3500
-  #num_warmup_steps: 0
   save_interval: 2500
   eval_interval: 1000
   learning_rate:
@@ -153,8 +152,8 @@ trainer:
     eps: 1.0e-08
     weight_decay: 1.0e-08
 
-  # parameters to be determined
   is_resume: false
+  resume_from_checkpoint: null
   resume_epoch: null
   resume_step: null
   enable_gradient_checkpointing: false

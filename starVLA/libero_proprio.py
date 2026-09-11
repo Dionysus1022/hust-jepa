@@ -40,6 +40,70 @@ def canonicalize_axis_angle(axis_angle: np.ndarray) -> np.ndarray:
     return vec * (wrapped_theta / safe_theta)
 
 
+def quaternion_xyzw_to_axis_angle(quaternion: np.ndarray) -> np.ndarray:
+    """Convert XYZW quaternions to shortest-arc axis-angle vectors."""
+    quat = np.asarray(quaternion, dtype=np.float32)
+    if quat.shape[-1] != 4:
+        raise ValueError(f"Expected last dimension 4 for XYZW quaternion, got shape {quat.shape}")
+
+    norm = np.linalg.norm(quat, axis=-1, keepdims=True)
+    identity = np.zeros_like(quat, dtype=np.float32)
+    identity[..., 3] = 1.0
+    quat = np.where(norm > 1e-8, quat / np.maximum(norm, 1e-8), identity)
+
+    # q and -q encode the same rotation. Keeping w non-negative selects the
+    # shortest rotation and avoids discontinuities around 2*pi.
+    quat = np.where(quat[..., 3:4] < 0.0, -quat, quat)
+    sin_half = np.linalg.norm(quat[..., :3], axis=-1, keepdims=True)
+    angle = 2.0 * np.arctan2(sin_half, np.clip(quat[..., 3:4], 0.0, 1.0))
+    scale = np.where(sin_half > 1e-8, angle / np.maximum(sin_half, 1e-8), 2.0)
+    return canonicalize_axis_angle(quat[..., :3] * scale)
+
+
+def euler_rpy_to_axis_angle(euler_rpy: np.ndarray) -> np.ndarray:
+    """Convert extrinsic XYZ roll-pitch-yaw angles to axis-angle vectors."""
+    rpy = np.asarray(euler_rpy, dtype=np.float32)
+    if rpy.shape[-1] != 3:
+        raise ValueError(f"Expected last dimension 3 for RPY angles, got shape {rpy.shape}")
+
+    half = 0.5 * rpy
+    sr, sp, sy = np.sin(half[..., 0]), np.sin(half[..., 1]), np.sin(half[..., 2])
+    cr, cp, cy = np.cos(half[..., 0]), np.cos(half[..., 1]), np.cos(half[..., 2])
+    quat_xyzw = np.stack(
+        [
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+            cr * cp * cy + sr * sp * sy,
+        ],
+        axis=-1,
+    )
+    return quaternion_xyzw_to_axis_angle(quat_xyzw)
+
+
+def oxe_bridge_state_8d_to_normalized_proprio(state: np.ndarray) -> np.ndarray:
+    """Convert Bridge [xyz, RPY, pad, gripper] state to canonical normalized 7D."""
+    arr = np.asarray(state, dtype=np.float32)
+    if arr.shape[-1] != 8:
+        raise ValueError(f"Expected last dimension 8 for Bridge state, got shape {arr.shape}")
+    rotation = euler_rpy_to_axis_angle(arr[..., 3:6])
+    proprio = np.concatenate([arr[..., :3], rotation, arr[..., 7:8]], axis=-1)
+    return normalize_libero_eef_proprio(proprio)
+
+
+def oxe_rt1_state_8d_to_normalized_proprio(state: np.ndarray) -> np.ndarray:
+    """Convert RT-1 [xyz, quaternion_xyzw, gripper_closed] to normalized open-state 7D."""
+    arr = np.asarray(state, dtype=np.float32)
+    if arr.shape[-1] != 8:
+        raise ValueError(f"Expected last dimension 8 for RT-1 state, got shape {arr.shape}")
+    rotation = quaternion_xyzw_to_axis_angle(arr[..., 3:7])
+    # Fractal exposes observation.gripper_closed (0=open, 1=closed), while the
+    # canonical VLA-JEPA proprio convention is gripper_open (0=closed, 1=open).
+    gripper_open = 1.0 - np.clip(arr[..., 7:8], 0.0, 1.0)
+    proprio = np.concatenate([arr[..., :3], rotation, gripper_open], axis=-1)
+    return normalize_libero_eef_proprio(proprio)
+
+
 def libero_state_8d_to_normalized_proprio(state: np.ndarray) -> np.ndarray:
     """Convert raw LIBERO 8D EEF+gripper state to normalized 7D proprio."""
     arr = np.asarray(state, dtype=np.float32)
@@ -51,13 +115,28 @@ def libero_state_8d_to_normalized_proprio(state: np.ndarray) -> np.ndarray:
 
 
 def droid_state_8d_to_proprio_7d(state: np.ndarray) -> np.ndarray:
-    """Convert DROID [eef_xyz, eef_rpy, pad, gripper] state to 7D proprio."""
+    """Legacy raw DROID conversion that only removes the padding slot."""
     arr = np.asarray(state, dtype=np.float32)
     if arr.shape[-1] != 8:
         raise ValueError(f"Expected last dimension 8 for raw DROID state, got shape {arr.shape}")
     return np.concatenate([arr[..., :6], arr[..., 7:8]], axis=-1)
 
 
+def droid_state_8d_to_normalized_proprio(state: np.ndarray) -> np.ndarray:
+    """Convert DROID [xyz, RPY, pad, gripper_closed] to canonical normalized 7D.
+
+    DROID reports gripper position as ``1 - width / max_width`` (0=open,
+    1=closed).  VLA-JEPA's cross-embodiment convention stores gripper_open.
+    """
+    arr = np.asarray(state, dtype=np.float32)
+    if arr.shape[-1] != 8:
+        raise ValueError(f"Expected last dimension 8 for raw DROID state, got shape {arr.shape}")
+    rotation = euler_rpy_to_axis_angle(arr[..., 3:6])
+    gripper_open = 1.0 - np.clip(arr[..., 7:8], 0.0, 1.0)
+    proprio = np.concatenate([arr[..., :3], rotation, gripper_open], axis=-1)
+    return normalize_libero_eef_proprio(proprio)
+
+
 def libero_zero_pad_normalized_proprio() -> np.ndarray:
-    """Return the normalized 7D state produced by training-time raw zero padding."""
+    """Return normalized raw-zero state for legacy evaluation compatibility."""
     return libero_state_8d_to_normalized_proprio(np.zeros(8, dtype=np.float32))

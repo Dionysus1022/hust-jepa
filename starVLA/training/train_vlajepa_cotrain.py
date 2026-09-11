@@ -39,7 +39,12 @@ from transformers import AutoProcessor, get_scheduler
 
 # Local Modules
 from starVLA.dataloader import build_dataloader
-from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
+from starVLA.training.trainer_utils.trainer_tools import (
+    compose_vlajepa_loss,
+    normalize_dotlist_args,
+    read_accelerate_checkpoint_metadata,
+    resolve_accelerate_checkpoint,
+)
 from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 
@@ -64,6 +69,26 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 logger = get_logger(__name__)
+
+
+def _materialize_scalar_metrics(metrics):
+    """Copy scalar tensors to Python values with one sync per source device."""
+    materialized = {}
+    tensor_groups = {}
+    for key, value in metrics.items():
+        if torch.is_tensor(value) and value.numel() == 1:
+            tensor_groups.setdefault(value.device, []).append((key, value))
+        else:
+            materialized[key] = value
+
+    for entries in tensor_groups.values():
+        stacked = torch.stack(
+            [value.detach().reshape(()).to(dtype=torch.float32) for _, value in entries]
+        )
+        host_values = stacked.cpu().tolist()
+        for (key, _), value in zip(entries, host_values):
+            materialized[key] = value
+    return materialized
 
 
 def load_fast_tokenizer():
@@ -146,6 +171,8 @@ class VLAMTrainer(TrainerUtils):
 
         # training status tracking
         self.completed_steps = 0
+        self.consumed_vla_batches = 0
+        self.consumed_video_batches = 0
         self.total_batch_size = self._calculate_total_batch_size()
 
     def _move_batch_to_device(self, batch):
@@ -221,6 +248,49 @@ class VLAMTrainer(TrainerUtils):
                 merged[key] = torch.cat(values, dim=0)
         return merged
 
+    @staticmethod
+    def _merge_vj_feature_expand_indices(batches, vj_inputs, video_shapes):
+        """Map concatenated physical V-JEPA inputs back to logical views."""
+        merged_indices = []
+        physical_offset = 0
+        for batch, vj_input, video_shape in zip(batches, vj_inputs, video_shapes):
+            if not torch.is_tensor(vj_input):
+                raise TypeError("Preprocessed V-JEPA inputs must be tensors")
+            if video_shape is None:
+                raise RuntimeError("video_shape is required for preprocessed V-JEPA inputs")
+
+            expected_logical_videos = int(video_shape[0]) * int(video_shape[1])
+            physical_videos = int(vj_input.shape[0])
+            local_indices = batch.get("vj_feature_expand_indices", None)
+            if local_indices is None:
+                if physical_videos != expected_logical_videos:
+                    raise RuntimeError(
+                        "Preprocessed V-JEPA input count differs from B * V, but "
+                        "vj_feature_expand_indices was not provided."
+                    )
+                local_indices = torch.arange(physical_videos, dtype=torch.long)
+            else:
+                local_indices = torch.as_tensor(local_indices, dtype=torch.long)
+                if local_indices.ndim != 1 or local_indices.numel() != expected_logical_videos:
+                    raise RuntimeError(
+                        "vj_feature_expand_indices must be a 1D tensor with B * V entries; "
+                        f"expected {expected_logical_videos}, got shape {tuple(local_indices.shape)}."
+                    )
+                if local_indices.device.type != "cpu":
+                    local_indices = local_indices.cpu()
+                if physical_videos == 0 or torch.any(local_indices < 0) or torch.any(
+                    local_indices >= physical_videos
+                ):
+                    raise RuntimeError(
+                        "vj_feature_expand_indices contains an index outside the local "
+                        f"physical input range [0, {physical_videos})."
+                    )
+
+            merged_indices.append(local_indices + physical_offset)
+            physical_offset += physical_videos
+
+        return torch.cat(merged_indices, dim=0)
+
     def _merge_cotrain_batches(self, batch_vla, batch_vlm):
         batch_vla = self._as_collated_dict(batch_vla)
         batch_vlm = self._as_collated_dict(batch_vlm)
@@ -240,6 +310,13 @@ class VLAMTrainer(TrainerUtils):
 
         vla_video_shape = channel_first_video_shape(batch_vla, vla_video)
         vlm_video_shape = channel_first_video_shape(batch_vlm, vlm_video)
+        vj_feature_expand_indices = None
+        if has_full_vj_inputs:
+            vj_feature_expand_indices = self._merge_vj_feature_expand_indices(
+                (batch_vla, batch_vlm),
+                vj_inputs,
+                (vla_video_shape, vlm_video_shape),
+            )
         can_drop_raw_video = (
             has_full_vj_inputs
             and vla_video_shape is not None
@@ -273,6 +350,8 @@ class VLAMTrainer(TrainerUtils):
             )
         if any(item is not None for item in vj_inputs):
             mixed["vj_pixel_values_videos"] = vj_inputs
+        if vj_feature_expand_indices is not None:
+            mixed["vj_feature_expand_indices"] = vj_feature_expand_indices
         return mixed
 
     def prepare_training(self):
@@ -280,8 +359,9 @@ class VLAMTrainer(TrainerUtils):
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
         set_seed(seed)
 
+        is_resume = bool(self.config.trainer.get("is_resume", False))
         pretrained_checkpoint = self.config.trainer.get("pretrained_checkpoint", None)
-        if pretrained_checkpoint:
+        if pretrained_checkpoint and not is_resume:
             reload_modules = self.config.trainer.get("reload_modules", None)
             ignore_mismatched_sizes = bool(self.config.trainer.get("ignore_mismatched_pretrained", False))
             self.model = self.load_pretrained_backbones(
@@ -297,9 +377,16 @@ class VLAMTrainer(TrainerUtils):
         # initialize distributed training components
         self.model, self.optimizer, self.vla_train_dataloader, self.video_train_dataloader = (
             self.setup_distributed_training(
-                self.accelerator, self.model, self.optimizer, self.vla_train_dataloader, self.video_train_dataloader
+                self.accelerator,
+                self.model,
+                self.optimizer,
+                self.vla_train_dataloader,
+                self.video_train_dataloader,
             )
         )
+        # Keep the scheduler unwrapped so one optimizer update advances it
+        # exactly once; registering still makes Accelerate save/load its state.
+        self.accelerator.register_for_checkpointing(self.lr_scheduler)
 
         #self._init_wandb()
         self._init_checkpointing()
@@ -328,93 +415,131 @@ class VLAMTrainer(TrainerUtils):
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
-        pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
-        is_resume = getattr(self.config.trainer, "is_resume", False)
-
-        # resume training state
-        if pretrained_checkpoint and is_resume:
-            self._load_checkpoint(self.config.resume_from_checkpoint)
+        if bool(self.config.trainer.get("is_resume", False)):
+            requested = self.config.trainer.get("resume_from_checkpoint", None)
+            resume_step = self.config.trainer.get("resume_step", None)
+            if requested is None and resume_step is not None:
+                requested = os.path.join(self.checkpoint_dir, f"steps_{int(resume_step)}")
+            checkpoint_path = resolve_accelerate_checkpoint(self.checkpoint_dir, requested)
+            self._load_checkpoint(checkpoint_path)
 
     def _load_checkpoint(self, checkpoint_path):
-        """load checkpoint"""
-        self.accelerator.load_state(checkpoint_path)
+        """Restore model, optimizer, scheduler, scaler, RNG, and trainer step."""
+        self.accelerator.load_state(str(checkpoint_path))
+        state = read_accelerate_checkpoint_metadata(checkpoint_path)
+        self.completed_steps = int(state["completed_steps"])
+        fallback_batches = self.completed_steps * self.accelerator.gradient_accumulation_steps
+        self.consumed_vla_batches = int(state.get("consumed_vla_batches", fallback_batches))
+        self.consumed_video_batches = int(state.get("consumed_video_batches", fallback_batches))
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
     def _save_checkpoint(self):
         """save current training state"""
 
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
+        # All ranks must participate in DeepSpeed checkpointing. Accelerate
+        # persists model/optimizer/scheduler/scaler and per-rank RNG state.
+        self.accelerator.save_state(checkpoint_path)
+        self.accelerator.wait_for_everyone()
+
         if self.accelerator.is_main_process:
-
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
-            # save model state
-            state_dict = self.accelerator.get_state_dict(self.model)
-            torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
-
-            # save training metadata
+            with open(os.path.join(checkpoint_path, "trainer_state.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "completed_steps": self.completed_steps,
+                        "consumed_vla_batches": self.consumed_vla_batches,
+                        "consumed_video_batches": self.consumed_video_batches,
+                    },
+                    f,
+                    indent=2,
+                )
             summary_data = {
                 "steps": self.completed_steps,
+                "accelerate_checkpoint": checkpoint_path,
             }
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
-            self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
+        self.accelerator.wait_for_everyone()
+
+        # Preserve the existing model-only artifact used by deployment while
+        # making the sibling directory the authoritative resume checkpoint.
+        state_dict = self.accelerator.get_state_dict(self.model)
+        self.accelerator.save(state_dict, checkpoint_path + "_pytorch_model.pt")
+        self.accelerator.print(f"✅ Training state saved at {checkpoint_path}")
         self.accelerator.wait_for_everyone()
 
     def _log_metrics(self, metrics):
         """record training metrics"""
-        if (
-            self.completed_steps % self.config.trainer.logging_frequency == 0
-        ):  # some parameters should be initialized for the class
-            if dist.get_rank() == 0:
-                # calculate gradient norm
-                # total_norm = 0.0
-                # for p in self.model.parameters():
-                #     if p.grad is not None:
-                #         total_norm += p.grad.data.norm(2).item() ** 2
-                # metrics["grad_norm"] = total_norm ** 0.5
+        if self.completed_steps % int(self.config.trainer.logging_frequency) != 0:
+            return
+        if dist.is_initialized():
+            is_main_process = dist.get_rank() == 0
+        else:
+            is_main_process = getattr(self.accelerator, "is_main_process", True)
+        if not is_main_process:
+            return
 
-                # add learning rate
-                metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
+        metrics = dict(metrics)
+        metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
+        metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+        metrics = _materialize_scalar_metrics(metrics)
 
-                # add epoch information
-                metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+        # record to W&B
+        # wandb.log(metrics, step=self.completed_steps)
+        log_full_metrics = bool(self.config.trainer.get("log_full_metrics", False))
+        if log_full_metrics:
+            logger.info(f"Step {self.completed_steps}, Loss: {metrics}")
+            return
 
-                # record to W&B
-                #wandb.log(metrics, step=self.completed_steps)
-                # debug output
-                log_full_metrics = bool(self.config.trainer.get("log_full_metrics", False))
-                if log_full_metrics:
-                    logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
-                    return
-
-                log_keys = [
-                    "loss",
-                    "action_loss",
-                    "wm_loss",
-                    "future_token_loss",
-                    "action_dct_loss",
-                    "data_time",
-                    "model_time",
-                    "timing/mixed_forward_time",
-                    "timing/backward_grad_sync_time",
-                    "timing/deepspeed_step_time",
-                    "learning_rate",
-                    "epoch",
-                ]
-                compact_metrics = {}
-                for key in log_keys:
-                    if key not in metrics:
-                        continue
-                    value = metrics[key]
-                    compact_metrics[key] = round(float(value), 6) if isinstance(value, (int, float)) else value
-                logger.info(f"Step {self.completed_steps}, Metrics: {compact_metrics}")
+        log_keys = [
+            "loss",
+            "action_loss",
+            "wm_loss",
+            "future_token_loss",
+            "action_dct_loss",
+            "data_time",
+            "model_time",
+            "timing/mixed_forward_time",
+            "timing/backward_grad_sync_time",
+            "timing/deepspeed_step_time",
+            "learning_rate",
+            "epoch",
+        ]
+        compact_metrics = {}
+        for key in log_keys:
+            if key not in metrics:
+                continue
+            value = metrics[key]
+            compact_metrics[key] = (
+                round(float(value), 6) if isinstance(value, (int, float)) else value
+            )
+        logger.info(f"Step {self.completed_steps}, Metrics: {compact_metrics}")
 
     def _create_data_iterators(self):
         """create data iterators"""
-        self.vla_iter = iter(self.vla_train_dataloader)
-        self.vlm_iter = iter(self.video_train_dataloader)
+        self.vla_iter, self.vla_epoch_count = self._resume_data_iterator(
+            self.vla_train_dataloader, self.consumed_vla_batches
+        )
+        self.vlm_iter, self.vlm_epoch_count = self._resume_data_iterator(
+            self.video_train_dataloader, self.consumed_video_batches
+        )
+
+    def _resume_data_iterator(self, dataloader, consumed_batches):
+        """Restore the dataloader's logical epoch and yielded-batch offset."""
+        epoch, offset = divmod(consumed_batches, len(dataloader))
+        if callable(getattr(dataloader, "set_epoch", None)):
+            dataloader.set_epoch(epoch)
+        resumed = self.accelerator.skip_first_batches(dataloader, offset) if offset else dataloader
+        if self.completed_steps:
+            self.accelerator.print(
+                f"Resuming dataloader at epoch={epoch}, batch_offset={offset}/{len(dataloader)}"
+            )
+        return iter(resumed), epoch
 
     def _warmup_data_iterators(self):
         """Prime dataloader workers so processor construction and first prefetches happen outside timed steps."""
+        if self.completed_steps:
+            return
         trainer_cfg = getattr(self.config, "trainer", {})
         default_warmup_steps = max(
             int(self.config.datasets.vla_data.get("num_workers", 0)),
@@ -454,6 +579,8 @@ class VLAMTrainer(TrainerUtils):
             self.vlm_iter, self.vlm_epoch_count = self._reset_dataloader(self.video_train_dataloader, self.vlm_epoch_count)
             batch_vlm = next(self.vlm_iter)
 
+        self.consumed_vla_batches += 1
+        self.consumed_video_batches += 1
         return batch_vla, batch_vlm
 
     def _add_distributed_timing_stats(self, step_metrics):
@@ -497,8 +624,15 @@ class VLAMTrainer(TrainerUtils):
         self._warmup_data_iterators()
 
         # create progress bar
+        progress_refresh_interval = max(
+            1, int(self.config.trainer.get("progress_refresh_interval", 10))
+        )
         progress_bar = tqdm(
-            range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
+            total=self.config.trainer.max_train_steps,
+            initial=self.completed_steps,
+            disable=not self.accelerator.is_local_main_process,
+            mininterval=float(self.config.trainer.get("progress_mininterval", 1.0)),
+            miniters=progress_refresh_interval,
         )
 
         # main training loop
@@ -551,7 +685,16 @@ class VLAMTrainer(TrainerUtils):
                     dist.barrier()  # ensure all processes are synchronized, avoid timeout
 
             # check termination condition
-            if self.accelerator.is_local_main_process:
+            should_refresh_progress = (
+                self.accelerator.is_local_main_process
+                and is_update_step
+                and (
+                    self.completed_steps == 1
+                    or self.completed_steps % progress_refresh_interval == 0
+                    or self.completed_steps >= self.config.trainer.max_train_steps
+                )
+            )
+            if should_refresh_progress:
                 postfix = {
                     "data_times": f"{t_end_data - t_start_data:.3f}",
                     "model_times": f"{t_end_model - t_start_model:.3f}",
@@ -567,7 +710,7 @@ class VLAMTrainer(TrainerUtils):
                             "vj_prep": f"{step_metrics.get('mixed/forward/vj_processor_h2d_time', 0.0):.3f}",
                         }
                     )
-                progress_bar.set_postfix(postfix)
+                progress_bar.set_postfix(postfix, refresh=False)
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
                 break
@@ -586,24 +729,34 @@ class VLAMTrainer(TrainerUtils):
         :return: Average metric score across the evaluation dataset.
         """
 
+        # Advance both distributed iterators on every rank. Only rank 0 runs
+        # the expensive metric computation, but all ranks retain one logical
+        # data cursor for checkpoint/resume.
+        examples, vlm_data = self._get_next_batch()
         if self.accelerator.is_main_process:
-
-            examples, vlm_data = self._get_next_batch()
 
             score = 0.0
             if isinstance(examples, dict):
                 batch_images = examples["image"]
                 instructions = examples["lang"]
                 actions = examples["action"].detach().cpu().numpy() if torch.is_tensor(examples["action"]) else examples["action"]
+                state = examples.get("state", None)
+                if torch.is_tensor(state):
+                    state = state.detach().cpu().numpy()
             else:
                 batch_images = [example["image"] for example in examples]
                 instructions = [example["lang"] for example in examples]  # [B, str]
                 actions = [example["action"] for example in examples]  # label
+                state = [example["state"] for example in examples] if "state" in examples[0] else None
             num_samples = len(instructions)
 
             # Predict actions using the model
             output_dict = self.model.predict_action(
-                batch_images=batch_images, instructions=instructions, use_ddim=True, num_ddim_steps=20
+                batch_images=batch_images,
+                instructions=instructions,
+                state=state,
+                use_ddim=True,
+                num_ddim_steps=20,
             )
 
             normalized_actions = output_dict["normalized_actions"]  # B, T, D
@@ -666,7 +819,10 @@ class VLAMTrainer(TrainerUtils):
             output_dict = timed("timing/mixed_forward_time", lambda: self.model.forward(batch_mixed))
             mixed_forward_timing = get_forward_timing("mixed")
 
-        total_loss = timed("timing/loss_sum_time", lambda: sum(output_dict.values()))
+        total_loss = timed(
+            "timing/loss_sum_time",
+            lambda: compose_vlajepa_loss(output_dict, self.config.trainer.get("loss_scale", {})),
+        )
 
         is_update_step = True
         if hasattr(self.model, "backward") and hasattr(self.model, "step"):
@@ -684,8 +840,8 @@ class VLAMTrainer(TrainerUtils):
                 is_update_step = bool(self.accelerator.sync_gradients)
 
         for k, v in output_dict.items():
-            log_dict[k] = v.item()
-        log_dict["loss"] = total_loss.item()
+            log_dict[k] = v.detach() if torch.is_tensor(v) else v
+        log_dict["loss"] = total_loss.detach() if torch.is_tensor(total_loss) else total_loss
         log_dict["is_update_step"] = is_update_step
         if detailed_timing:
             log_dict.update(mixed_forward_timing)

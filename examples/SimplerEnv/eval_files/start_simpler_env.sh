@@ -3,12 +3,15 @@
 #echo `which python`
 
 #export sim_python=/mnt/petrelfs/share/yejinhui/Envs/miniconda3/envs/dinoact/bin/python
-export SimplerEnv_PATH=/home/dataset-local/SimplerEnv
+: "${sim_python:=/home/WangBizi/miniconda3/envs/simpler_env/bin/python}"
+: "${SimplerEnv_PATH:=/home/WangBizi/SimplerEnv}"
+: "${VK_ICD_FILENAMES:=/etc/vulkan/icd.d/nvidia_icd.json}"
+export VK_ICD_FILENAMES
 #export PYTHONPATH=$(pwd):${PYTHONPATH}
 #### set environment variables #####
 
 #### get parameters #####
-MODEL_PATH=/home/dataset-local/starVLA_A100/checkpoints/direct_ft/oxe/JEVLA_wo_human/checkpoints/steps_120000_pytorch_model.pt
+MODEL_PATH=${1:-/data/WangBizi/VLA_JEPA_models/pretrain_checkpoint/SimplerEnv/checkpoints/VLA-JEPA-SimplerEnv.pt}
 
 port=${2:-6680} # connect to your policy server port
 
@@ -55,7 +58,7 @@ for i in "${!ENV_NAMES[@]}"; do
     task_log="${output_eval_dir}/${ckpt_name}_${env}_run${run_idx}.log"
     echo "▶️ Launching task [${env}] run#${run_idx}, log → ${task_log}"
 
-    python examples/SimplerEnv/eval_files/start_simpler_env.py \
+    "${sim_python}" examples/SimplerEnv/eval_files/start_simpler_env.py \
       --ckpt-path ${ckpt_path} \
       --port ${port} \
       --robot ${robot} \
@@ -96,7 +99,7 @@ for i in "${!ENV_NAMES_V2[@]}"; do
     task_log="${output_eval_dir}/${ckpt_name}_${env}_run${run_idx}.log"
     echo "▶️ Launching V2 task [${env}] run#${run_idx}, log → ${task_log}"
 
-    python examples/SimplerEnv/eval_files/start_simpler_env.py\
+    "${sim_python}" examples/SimplerEnv/eval_files/start_simpler_env.py\
       --ckpt-path ${ckpt_path} \
       --port ${port} \
       --robot ${robot} \

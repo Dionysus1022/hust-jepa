@@ -40,7 +40,12 @@ from tqdm import tqdm
 from transformers import AutoProcessor, get_scheduler
 
 # Local Modules
-from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
+from starVLA.training.trainer_utils.trainer_tools import (
+    compose_vlajepa_loss,
+    normalize_dotlist_args,
+    read_accelerate_checkpoint_metadata,
+    resolve_accelerate_checkpoint,
+)
 from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
@@ -189,6 +194,7 @@ class VLATrainer(TrainerUtils):
 
         # training status tracking
         self.completed_steps = 0
+        self.consumed_vla_batches = 0
         self.total_batch_size = self._calculate_total_batch_size()
 
     def _move_batch_to_device(self, batch):
@@ -216,8 +222,9 @@ class VLATrainer(TrainerUtils):
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
         set_seed(seed)
 
+        is_resume = bool(self.config.trainer.get("is_resume", False))
         pretrained_checkpoint = self.config.trainer.get("pretrained_checkpoint", None)
-        if pretrained_checkpoint:
+        if pretrained_checkpoint and not is_resume:
             reload_modules = self.config.trainer.get("reload_modules", None)
             ignore_mismatched_sizes = bool(self.config.trainer.get("ignore_mismatched_pretrained", False))
             self.model = self.load_pretrained_backbones(
@@ -238,6 +245,9 @@ class VLATrainer(TrainerUtils):
             self.vla_train_dataloader,
             # self.vlm_train_dataloader
         )
+        # Avoid AcceleratedScheduler's world-size stepping while still making
+        # the scheduler part of every save_state/load_state transaction.
+        self.accelerator.register_for_checkpointing(self.lr_scheduler)
 
         #self._init_wandb()
         self._init_checkpointing()
@@ -266,35 +276,51 @@ class VLATrainer(TrainerUtils):
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
-        pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
-        is_resume = getattr(self.config.trainer, "is_resume", False)
-
-        # resume training state
-        if pretrained_checkpoint and is_resume:
-            self._load_checkpoint(self.config.resume_from_checkpoint)
+        if bool(self.config.trainer.get("is_resume", False)):
+            requested = self.config.trainer.get("resume_from_checkpoint", None)
+            resume_step = self.config.trainer.get("resume_step", None)
+            if requested is None and resume_step is not None:
+                requested = os.path.join(self.checkpoint_dir, f"steps_{int(resume_step)}")
+            checkpoint_path = resolve_accelerate_checkpoint(self.checkpoint_dir, requested)
+            self._load_checkpoint(checkpoint_path)
 
     def _load_checkpoint(self, checkpoint_path):
-        """load checkpoint"""
-        self.accelerator.load_state(checkpoint_path)
+        """Restore model, optimizer, scheduler, scaler, RNG, and trainer step."""
+        self.accelerator.load_state(str(checkpoint_path))
+        state = read_accelerate_checkpoint_metadata(checkpoint_path)
+        self.completed_steps = int(state["completed_steps"])
+        fallback_batches = self.completed_steps * self.accelerator.gradient_accumulation_steps
+        self.consumed_vla_batches = int(state.get("consumed_vla_batches", fallback_batches))
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
     def _save_checkpoint(self):
         """save current training state"""
 
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
+        self.accelerator.save_state(checkpoint_path)
+        self.accelerator.wait_for_everyone()
+
         if self.accelerator.is_main_process:
-
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
-            # save model state
-            state_dict = self.accelerator.get_state_dict(self.model)
-            torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
-
-            # save training metadata
+            with open(os.path.join(checkpoint_path, "trainer_state.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "completed_steps": self.completed_steps,
+                        "consumed_vla_batches": self.consumed_vla_batches,
+                    },
+                    f,
+                    indent=2,
+                )
             summary_data = {
                 "steps": self.completed_steps,
+                "accelerate_checkpoint": checkpoint_path,
             }
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
-            self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
+        self.accelerator.wait_for_everyone()
+
+        state_dict = self.accelerator.get_state_dict(self.model)
+        self.accelerator.save(state_dict, checkpoint_path + "_pytorch_model.pt")
+        self.accelerator.print(f"✅ Training state saved at {checkpoint_path}")
         self.accelerator.wait_for_everyone()
 
     def _log_metrics(self, metrics):
@@ -314,7 +340,21 @@ class VLATrainer(TrainerUtils):
 
     def _create_data_iterators(self):
         """create data iterators"""
-        self.vla_iter = iter(self.vla_train_dataloader)
+        consumed_batches = self.consumed_vla_batches
+        epoch, offset = divmod(consumed_batches, len(self.vla_train_dataloader))
+        if callable(getattr(self.vla_train_dataloader, "set_epoch", None)):
+            self.vla_train_dataloader.set_epoch(epoch)
+        resumed = (
+            self.accelerator.skip_first_batches(self.vla_train_dataloader, offset)
+            if offset
+            else self.vla_train_dataloader
+        )
+        self.vla_iter = iter(resumed)
+        self.vla_epoch_count = epoch
+        if self.completed_steps:
+            self.accelerator.print(
+                f"Resuming dataloader at epoch={epoch}, batch_offset={offset}/{len(self.vla_train_dataloader)}"
+            )
         # self.vlm_iter = iter(self.vlm_train_dataloader)
 
     def _get_next_batch(self):
@@ -329,6 +369,7 @@ class VLATrainer(TrainerUtils):
             )
             batch_vla = next(self.vla_iter)
 
+        self.consumed_vla_batches += 1
         return batch_vla
 
     import torch
@@ -398,7 +439,9 @@ class VLATrainer(TrainerUtils):
 
         # create progress bar
         progress_bar = tqdm(
-            range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
+            total=self.config.trainer.max_train_steps,
+            initial=self.completed_steps,
+            disable=not self.accelerator.is_local_main_process,
         )
 
         # main training loop
@@ -498,9 +541,9 @@ class VLATrainer(TrainerUtils):
         :return: Average metric score across the evaluation dataset.
         """
 
+        # Keep every rank's training-data cursor aligned across evaluation.
+        examples = self._get_next_batch()
         if self.accelerator.is_main_process:
-
-            examples = self._get_next_batch()
 
             score = 0.0
             num_samples = len(examples)
@@ -578,7 +621,10 @@ class VLATrainer(TrainerUtils):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             output_dict = timed("timing/forward_total_time", lambda: self.model.forward(batch_vla))
 
-            total_loss = timed("timing/loss_sum_time", lambda: sum(output_dict.values()))
+            total_loss = timed(
+                "timing/loss_sum_time",
+                lambda: compose_vlajepa_loss(output_dict, self.config.trainer.get("loss_scale", {})),
+            )
 
         # DeepSpeed separates backward from its boundary-aware step. The
         # backward timer includes autograd plus gradient communication.

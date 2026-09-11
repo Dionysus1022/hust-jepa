@@ -92,6 +92,8 @@ class Args:
     num_trials_per_task: int = 50  # Number of rollouts per task
     max_steps: int | None = None  # Optional policy-step limit override.
     replan_steps: int = 3  # Execute this many actions from each predicted chunk before replanning.
+    unnorm_key: str | None = None  # Dataset stats key used to unnormalize predicted actions.
+    gripper_encoding: str = "zero_one"  # Use minus_one_one for native LIBERO-Plus actions.
     category_value: str = "Background Textures"
             #Background Textures
         #Camera Viewpoints
@@ -155,10 +157,12 @@ def eval_libero(args: Args) -> None:
 
     model = M1Inference(
         policy_ckpt_path=args.pretrained_path, # to get unnormalization stats
+        unnorm_key=args.unnorm_key,
         host=args.host,
         port=args.port,
         image_size=args.resize_size,
         replan_steps=args.replan_steps,
+        gripper_encoding=args.gripper_encoding,
     )
 
 

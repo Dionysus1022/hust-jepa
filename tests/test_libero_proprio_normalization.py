@@ -4,11 +4,14 @@ import numpy as np
 
 from starVLA.libero_proprio import (
     canonicalize_axis_angle,
+    droid_state_8d_to_normalized_proprio,
     droid_state_8d_to_proprio_7d,
     libero_gripper_qpos_to_state,
     libero_state_8d_to_normalized_proprio,
     libero_zero_pad_normalized_proprio,
     normalize_libero_eef_proprio,
+    oxe_bridge_state_8d_to_normalized_proprio,
+    oxe_rt1_state_8d_to_normalized_proprio,
 )
 
 
@@ -79,3 +82,29 @@ def test_droid_state_8d_to_proprio_7d_drops_pad_and_preserves_gripper_scalar():
         [[0.52, 0.01, 0.31, 0.3, -0.1, -0.05, 1.0]],
         atol=1e-6,
     )
+
+
+def test_droid_state_uses_canonical_rotation_scale_and_open_gripper_convention():
+    raw_state = np.asarray(
+        [
+            [0.0, 0.0, 0.75, 0.5 * np.pi, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.75, 0.0, 0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    normalized = droid_state_8d_to_normalized_proprio(raw_state)
+
+    np.testing.assert_allclose(normalized[0], [0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 1.0], atol=1e-6)
+    np.testing.assert_allclose(normalized[1], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], atol=1e-6)
+
+
+def test_droid_google_and_widowx_share_the_same_canonical_numeric_semantics():
+    droid = np.asarray([0.0, 0.0, 0.75, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    google_rt1 = np.asarray([0.0, 0.0, 0.75, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    widowx_bridge = np.asarray([0.0, 0.0, 0.75, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+    expected = np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    np.testing.assert_allclose(droid_state_8d_to_normalized_proprio(droid), expected, atol=1e-6)
+    np.testing.assert_allclose(oxe_rt1_state_8d_to_normalized_proprio(google_rt1), expected, atol=1e-6)
+    np.testing.assert_allclose(oxe_bridge_state_8d_to_normalized_proprio(widowx_bridge), expected, atol=1e-6)

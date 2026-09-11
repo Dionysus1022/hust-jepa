@@ -72,6 +72,7 @@ datasets:
     video_resolution_size: 256
     load_all_data_for_training: true
     with_state: true
+    state_history_len: 8
     preprocess_vj_inputs_in_collate: true
     preprocess_qwen_inputs_in_collate: true
     num_workers: 4

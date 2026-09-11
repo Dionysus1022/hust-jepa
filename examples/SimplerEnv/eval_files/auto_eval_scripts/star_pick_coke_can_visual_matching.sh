@@ -5,7 +5,7 @@
 
 # Environment setup
 #cd /mnt/petrelfs/yejinhui/Projects/llavavla
-export star_vla_python=python
+: "${star_vla_python:=/home/WangBizi/miniconda3/envs/VLA_JEPA/bin/python}"
 : "${sim_python:?sim_python is not set (e.g. /path/to/SimplerEnv/env/bin/python)}"
 : "${SimplerEnv_PATH:?SimplerEnv_PATH is not set (e.g. /path/to/SimplerEnv)}"
 #export SimplerEnv_PATH=/mnt/petrelfs/share/yejinhui/Projects/SimplerEnv
@@ -20,7 +20,7 @@ MODEL_PATH=$1
 # Optional: allow overriding via argument
 if [ -z "$MODEL_PATH" ]; then
   echo "❌ MODEL_PATH not provided as the first argument; using default"
-export MODEL_PATH="/home/dataset-local/starVLA_A100/checkpoints/ssv2/setting1/oxe/JEVLA2_after_ssv2/checkpoints/steps_100000_pytorch_model.pt"
+export MODEL_PATH="/data/WangBizi/VLA_JEPA_models/pretrain_checkpoint/SimplerEnv/checkpoints/VLA-JEPA-SimplerEnv.pt"
 fi
 
 ckpt_dir=$(dirname "${MODEL_PATH}")
@@ -43,7 +43,7 @@ start_service() {
   local svc_log="${server_log_dir}/$(basename "${ckpt_path%.*}")_${task_name}_${port}.log"
   mkdir -p "${server_log_dir}"
   echo "▶️ Starting service on GPU ${gpu_id}, port ${port}"
-  CUDA_VISIBLE_DEVICES=${gpu_id} ${starvla_python} deployment/model_server/server_policy.py \
+  CUDA_VISIBLE_DEVICES=${gpu_id} ${star_vla_python} deployment/model_server/server_policy.py \
     --ckpt_path ${ckpt_path} \
     --port ${port} \
     --use_bf16 \

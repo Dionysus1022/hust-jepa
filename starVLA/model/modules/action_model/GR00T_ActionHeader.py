@@ -21,6 +21,7 @@ from starVLA.model.modules.action_model.flow_matching_head.action_encoder import
 )
 
 from starVLA.model.modules.action_model.flow_matching_head.cross_attention_dit import DiT
+from starVLA.model.modules.history_position_encoding import HistorySinusoidalEncoding
 
 # TODO try to meger DiT Modules with follow_match_head, they are just the same arch, but diff loss, use diffusers package will be simple
 
@@ -234,11 +235,32 @@ class FlowmatchingActionHead(nn.Module):
         self.action_horizon = config.future_action_window_size + 1
         self.num_inference_timesteps = config.num_inference_timesteps
 
-        self.state_encoder = MLP(
-            input_dim=config.state_dim,
-            hidden_dim=self.hidden_size,
-            output_dim=self.input_embedding_dim,
-        ) if config.state_dim else None
+        # Keep the legacy action-head state path opt-in configurable. VLANeXt-final
+        # conditions the action expert through the projected proprio/VLM tokens and
+        # does not add a second, independent state token stream to DiT hidden states.
+        # Default to True so existing checkpoints/configs retain their architecture.
+        self.use_state_encoder = bool(getattr(config, "use_state_encoder", True))
+        self.state_encoder = (
+            MLP(
+                input_dim=config.state_dim,
+                hidden_dim=self.hidden_size,
+                output_dim=self.input_embedding_dim,
+            )
+            if self.use_state_encoder and config.state_dim
+            else None
+        )
+        self.state_history_position = (
+            HistorySinusoidalEncoding(
+                hidden_size=self.input_embedding_dim,
+                max_history_len=int(
+                    full_config.get("datasets", {}).get("vla_data", {}).get(
+                        "state_history_len", 8
+                    )
+                ),
+            )
+            if self.state_encoder is not None
+            else None
+        )
 
         self.action_encoder = ActionEncoder(
             action_dim=config.action_dim,
@@ -295,7 +317,11 @@ class FlowmatchingActionHead(nn.Module):
 
 
         # embed state
-        state_features = self.state_encoder(state) if state is not None else None
+        state_features = (
+            self.state_history_position(self.state_encoder(state))
+            if state is not None and self.state_encoder is not None
+            else None
+        )
 
 
         # Maybe add position embedding.
@@ -345,7 +371,11 @@ class FlowmatchingActionHead(nn.Module):
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
         
-        state_features = self.state_encoder(state) if state is not None else None
+        state_features = (
+            self.state_history_position(self.state_encoder(state))
+            if state is not None and self.state_encoder is not None
+            else None
+        )
 
         # Run denoising steps.
         for t in range(num_steps):

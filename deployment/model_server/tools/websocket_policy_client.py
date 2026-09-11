@@ -50,8 +50,11 @@ class WebsocketClientPolicy:
                     max_size=None,
                     additional_headers=headers,
                     open_timeout=150,
-                    
-                    
+                    # A model inference may legitimately take longer than the
+                    # websockets default 20-second keepalive timeout, especially
+                    # when several model servers share one GPU.
+                    ping_interval=None,
+                    ping_timeout=None,
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
